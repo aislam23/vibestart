@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+dist
+**/dist
+build
+coverage
+.git
+.scratch
+.env
+.env.*
+webapp/e2e/.artifacts
+*.log

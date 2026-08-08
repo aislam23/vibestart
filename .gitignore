@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+coverage/
+.vite/
+.scratch/
+playwright-report/
+test-results/
+webapp/e2e/.artifacts/
+
+# Runtime and logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+bun-debug.log*
+
+# Environment files
+.env
+.env.*
+!backend/.env*.example
+!webapp/.env*.example
+!website/.env*.example
+infra/**/.env
+
+# Prisma generated client
+backend/src/generated/prisma/
+backend/.prisma-generate.lock
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
