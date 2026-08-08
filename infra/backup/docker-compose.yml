@@ -1,0 +1,71 @@
+# Restic-based encrypted Postgres backups to S3. No ports published - this
+# stack only ever reaches out (to `db` and to S3), never accepts inbound
+# traffic. See README.md for the full runbook.
+#
+# infra/supabase/docker-compose.yml pins its network's *runtime* name to
+# exactly `supabase` (`networks: supabase: name: supabase`, overriding the
+# project-prefixed default `supabase_supabase`) - this stack attaches to
+# that same fixed name as external so it can reach `db` by service name
+# regardless of which project started it or in what order.
+#
+# Usage:
+#   cp .env.example .env                          # fill in S3 + PG credentials
+#   docker compose up -d backup                    # scheduled crond service
+#   docker compose run --rm backup /usr/local/bin/backup.sh          # one-shot backup
+#   docker compose run --rm backup /usr/local/bin/restore.sh list    # list snapshots
+
+name: backup
+
+services:
+  backup:
+    container_name: vibestart-backup
+    build: .
+    # No `command:` on purpose: the entrypoint's default (no args) branch
+    # starts crond. `docker compose run --rm backup <cmd>` overrides args
+    # for one-shot backup.sh/restore.sh invocations - see entrypoint.sh.
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /etc/crontabs # entrypoint.sh writes the generated crontab here
+    volumes:
+      - restic-cache:/var/cache/restic
+      - backup-work:/work # pg_dump/pg_dumpall staging + restic restore target
+    environment:
+      TZ: ${TZ:-UTC}
+      BACKUP_CRON: ${BACKUP_CRON:-30 3 * * *}
+      PGHOST: ${PGHOST:-db}
+      PGPORT: ${PGPORT:-54322}
+      PGUSER: ${PGUSER:-postgres}
+      PGDATABASE: ${PGDATABASE:-postgres}
+      PGPASSWORD: ${PGPASSWORD:?PGPASSWORD is required - see .env.example}
+      S3_ENDPOINT: ${S3_ENDPOINT:?S3_ENDPOINT is required}
+      S3_BUCKET: ${S3_BUCKET:?S3_BUCKET is required}
+      S3_PATH: ${S3_PATH:-vibestart/postgres}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}
+      RESTIC_PASSWORD: ${RESTIC_PASSWORD:?RESTIC_PASSWORD is required - see .env.example}
+      RESTIC_TIMEOUT: ${RESTIC_TIMEOUT:-1800}
+      KEEP_DAILY: ${KEEP_DAILY:-7}
+      KEEP_WEEKLY: ${KEEP_WEEKLY:-4}
+      KEEP_MONTHLY: ${KEEP_MONTHLY:-6}
+      RESTIC_CHECK: ${RESTIC_CHECK:-weekly}
+      HEARTBEAT_URL: ${HEARTBEAT_URL:-}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - supabase
+
+networks:
+  supabase:
+    external: true
+    name: supabase
+
+volumes:
+  restic-cache:
+  backup-work:

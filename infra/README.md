@@ -11,7 +11,7 @@ rather than calling `docker compose` in each directory by hand.
 |---|---|---|---|
 | Edge proxy | `infra/edge` | 80, 443, 443/udp | done (T3) |
 | Supabase | `infra/supabase` | none - `127.0.0.1` only | done (T2) |
-| Backup | `infra/backup` | none | coming (T4) |
+| Backup | `infra/backup` | none | done (T4) |
 
 `backend` (Bun+Hono API, T5), `webapp` (React CSR build, T6), and `website`
 (Astro build, T7) aren't separate compose stacks - `backend` runs as its
@@ -65,6 +65,12 @@ proxied to directly - see `infra/supabase/README.md`.
 **commented out** by default; activating the connection is a deliberate,
 documented step (`infra/edge/README.md`, "First run on a VPS") rather than
 something that happens automatically.
+
+`infra/backup` is the one exception to "only `kong` joins a shared
+network": it attaches to the private `supabase` network (not `edge`) so
+it can reach `db` by service name to run `pg_dump`, same as `kong`
+reaches services on that network - it still never touches `edge` and
+publishes no ports of its own. See `infra/backup/README.md`.
 
 ## VPS bootstrap checklist
 

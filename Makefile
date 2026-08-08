@@ -9,6 +9,8 @@ SHELL := /bin/bash
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SUPABASE_DIR := $(ROOT_DIR)/infra/supabase
 EDGE_DIR := $(ROOT_DIR)/infra/edge
+BACKUP_DIR := $(ROOT_DIR)/infra/backup
+BACKUP_COMPOSE := docker compose -f "$(BACKUP_DIR)/docker-compose.yml"
 
 .DEFAULT_GOAL := help
 
@@ -64,12 +66,15 @@ down: ## Stop both stacks (edge, then supabase - reverse of up)
 	@$(MAKE) supabase-down
 
 .PHONY: status
-status: ## Show container status for both stacks + docker volume disk usage
+status: ## Show container status for all stacks + docker volume disk usage
 	@echo "== supabase =="
 	@out=$$(cd "$(SUPABASE_DIR)" && docker compose ps 2>&1); code=$$?; \
 	  if [ $$code -ne 0 ]; then echo "warning: $$out"; else echo "$$out"; fi
 	@echo "== edge =="
 	@out=$$(cd "$(EDGE_DIR)" && docker compose ps 2>&1); code=$$?; \
+	  if [ $$code -ne 0 ]; then echo "warning: $$out"; else echo "$$out"; fi
+	@echo "== backup =="
+	@out=$$($(BACKUP_COMPOSE) ps 2>&1); code=$$?; \
 	  if [ $$code -ne 0 ]; then echo "warning: $$out"; else echo "$$out"; fi
 	@echo "== docker volumes disk usage =="
 	@docker system df | grep -E '^TYPE|^Local Volumes' || docker system df
@@ -83,14 +88,23 @@ typecheck: ## Run typechecking across workspaces (bun run typecheck)
 	cd "$(ROOT_DIR)" && bun run typecheck
 
 .PHONY: backup
-backup: ## [not implemented] Trigger a Supabase backup - see infra/backup (T4)
-	@echo "not implemented yet — see infra/backup (T4) / .github (T7)" >&2
-	@exit 1
+backup: ## Run a one-shot Postgres backup to S3 now (see infra/backup)
+	$(BACKUP_COMPOSE) run --rm backup /usr/local/bin/backup.sh
 
 .PHONY: restore
-restore: ## [not implemented] Restore Supabase from a backup - see infra/backup (T4)
-	@echo "not implemented yet — see infra/backup (T4) / .github (T7)" >&2
-	@exit 1
+restore: ## List available backup snapshots - see infra/backup/README.md for the actual restore command (never automatic)
+	@echo "restore is never automatic — read infra/backup/README.md 'Restore procedure', then run:" >&2
+	@echo "  docker compose -f infra/backup/docker-compose.yml run --rm backup /usr/local/bin/restore.sh restore latest --yes" >&2
+	@echo "" >&2
+	$(BACKUP_COMPOSE) run --rm backup /usr/local/bin/restore.sh list
+
+.PHONY: backup-up
+backup-up: ## Start the scheduled backup crond service
+	$(BACKUP_COMPOSE) up -d
+
+.PHONY: backup-down
+backup-down: ## Stop the scheduled backup crond service
+	$(BACKUP_COMPOSE) down
 
 .PHONY: deploy
 deploy: ## [not implemented] Deploy to the VPS - see .github (T7)
