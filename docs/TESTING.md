@@ -19,6 +19,7 @@ bun run test:contracts       # packages/contracts — bun test src
 bun run test:backend         # backend — bun test src
 bun run test:webapp          # webapp — its own test runner
 bun run test:website         # website — its own test runner
+bun run test:supabase        # infra/supabase — bun test (generate-secrets.ts's --prod validation)
 bun run test:architecture    # scripts/architecture-check.test.mjs — tests the checker itself
 bun run architecture:check   # scripts/architecture-check.mjs — the actual boundary check (see docs/ARCHITECTURE.md)
 ```
@@ -64,10 +65,14 @@ separate job from the main `test` job, with its own Playwright browser cache.
 
 ### 4. Docker smoke — `bun run smoke:backend:docker`
 
-Needs Docker. Builds the real `backend/Dockerfile`, runs the image against `db_test`, and asserts
-`GET /health/ready` returns `200` — the same check a container orchestrator's readiness probe would
-make. Not run in CI today (see `.github/workflows/ci.yml`); run it locally before a release that
-touches the Dockerfile or the runtime bootstrap.
+Needs Docker. Builds the real `backend/Dockerfile`, runs the image against `db_test` **under the
+same production constraints `infra/app/docker-compose.yml` applies to `backend`** — `read_only`,
+a `/tmp` tmpfs, `no-new-privileges`, running as the image's non-root `bun` user, the exact compose
+healthcheck command, and a `--stop-timeout` matching `stop_grace_period` — and asserts `GET
+/health/ready` returns `200` via both a plain fetch and the container's own Docker healthcheck
+status, the same check a container orchestrator's readiness probe would make. Runs in CI as its own
+job (see below); also run it locally before a release that touches the Dockerfile, the runtime
+bootstrap, or the production compose constraints.
 
 ## Architecture check
 
@@ -87,8 +92,10 @@ module, feature, contracts, or platform boundaries change; it's also part of `bu
   since it needs Docker) → `bun run build`.
 - **`e2e` job**: installs Playwright's Chromium (cached, keyed on `bun.lock`) → `bun run
   e2e:webapp` (layer 3) → uploads the HTML report as an artifact on failure.
+- **`docker-smoke` job**: `bun run smoke:backend:docker` (layer 4) — the production-shape
+  container-contract check described above.
 
-Both jobs run in parallel; `ci.yml` needs no secrets — it never talks to anything outside the
+All three jobs run in parallel; `ci.yml` needs no secrets — it never talks to anything outside the
 runner. `.github/workflows/deploy.yml` does not re-run tests; it assumes `ci.yml` already passed on
 the commit being tagged.
 

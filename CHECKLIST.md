@@ -194,7 +194,7 @@ Verified by the agent during setup, not asked.
 
 - [ ] Durable answers above filled in, install status set to `completed YYYY-MM-DD`
 - [ ] Validation scope recorded for this project (which suites run before a change is called done): _unanswered_
-- [ ] Project identifiers renamed away from `vibestart` (`package.json` names, `@vibestart/*` workspace references, Docker container/network names, GHCR image names in `.github/workflows/deploy.yml`), `bun.lock` regenerated
+- [ ] Project identifiers renamed away from `vibestart` (`package.json` names, `@vibestart/*` workspace references, Docker `container_name`/network names, GHCR image names in `.github/workflows/deploy.yml`), `bun.lock` regenerated — `deploy.yml`'s health/log steps resolve the backend container via `docker compose ps -q backend` (the compose **service** name), not the literal `container_name`, so renaming `container_name: vibestart-backend` in `infra/app/docker-compose.yml` does not break the deploy healthcheck; only `infra/edge/Caddyfile`'s `reverse_proxy backend:3000` (which resolves the compose **service** name on the `app_edge` network, also unaffected by a `container_name` rename) needs no change either
 - [ ] Deferred-surface notes added to the READMEs of surfaces that are not active
 - [ ] `Bootstrap-Only Instructions` blocks deleted from `AGENTS.md` and `CLAUDE.md`
 - [ ] Local URLs, commands run, and anything the user must authorize manually (DNS, SMTP, S3 credentials, GitHub Actions secrets) reported back to the user

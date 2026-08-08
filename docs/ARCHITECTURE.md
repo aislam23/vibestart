@@ -120,31 +120,33 @@ fresh on every request. This split means:
 
 ## Runtime shape
 
-Production is one VPS running four Docker Compose stacks over one shared `edge` Docker network,
-plus two static builds Caddy serves directly:
+Production is one VPS running four Docker Compose stacks over two shared Docker networks (`edge`
+and the narrower `app_edge` - see "Network segmentation" below), plus two static builds Caddy
+serves through a versioned release directory:
 
 ```
                               Internet
                                  |
                             80 / 443 / 443-udp
                                  v
-                        infra/edge (caddy)
-                    /       |       |        \
-          webapp/dist  website/dist  backend:3000   kong:8000
-          (bind mount)  (bind mount)  (infra/app)    (infra/supabase)
-                                          |               |
-                                          v               v
-                                   infra/app         infra/supabase
-                                   backend       -->  db, auth, rest,
-                                   (supabase net)      realtime, storage,
-                                                        meta, studio, kong
+                   infra/edge (caddy: edge + app_edge)
+                    /                        \
+          releases/current              backend:3000   kong:8000
+          (bind mount - webapp/website    (app_edge)     (edge, infra/supabase)
+           dist inside)                       |               |
+                                               v               v
+                                        infra/app         infra/supabase
+                                        backend       -->  db, auth, rest,
+                                        (supabase net)      realtime, storage,
+                                                             meta, studio, kong
 ```
 
 Only `infra/edge` has ports open to the internet (80/443). `infra/supabase` binds every published
-port to `127.0.0.1`; `infra/app`'s `backend` service and `infra/supabase`'s `kong` service are the
-only two services that join the `edge` network, so Caddy can reach them by Docker service name.
-Full topology, the VPS bootstrap checklist, and the network diagram: `infra/README.md`. Deploy
-runbook: `docs/DEPLOYMENT.md`.
+port to `127.0.0.1`; `infra/supabase`'s `kong` service joins the `edge` network (so Caddy can reach
+it), while `infra/app`'s `backend` service instead joins the narrower `app_edge` network (shared
+only with Caddy) - a compromised `backend` can reach Caddy but not `kong` or anything else on
+`edge`. See `infra/app/README.md`, "Network segmentation". Full topology, the VPS bootstrap
+checklist, and the network diagram: `infra/README.md`. Deploy runbook: `docs/DEPLOYMENT.md`.
 
 ## Data model conventions
 

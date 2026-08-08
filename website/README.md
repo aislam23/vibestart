@@ -50,9 +50,11 @@ Build-time only - Astro inlines these into the static output, so they must be se
 | Variable | Required | Notes |
 | --- | --- | --- |
 | `PUBLIC_WEBSITE_URL` | no | The site's own public canonical origin, e.g. `https://example.com`. Used for `<link rel="canonical">` and `og:url` in `src/pages/index.astro`. Without it, pages omit both. |
-| `PUBLIC_WEBAPP_URL` | no | The webapp's public origin, e.g. `https://app.example.com`. When set, the landing page's secondary CTA links straight to it (`src/lib/landing-actions.ts`); when unset, it falls back to a local `#process` anchor. |
+| `PUBLIC_WEBAPP_URL` | no | The webapp's public origin, e.g. `https://app.example.com`. When set, the landing page's secondary CTA links straight to it (`src/lib/landing-actions.ts`); when unset, it falls back to a local `#process` anchor. **Must be `https://`** once `PUBLIC_SITE_ENV=production` (see below) - a plain `http://` origin (other than `localhost`/`127.0.0.1`, allowed for local dev) or a non-http(s) scheme fails the build instead of being silently emitted as a link `href`. |
+| `PUBLIC_REPO_URL` | only in production | This project's own `https://github.com/<owner>/<repo>` URL, used for the "View the template on GitHub" CTA (`src/lib/landing-actions.ts`'s `TEMPLATE_ACTION`). Falls back to the template's own placeholder repo URL when unset - fine for local dev, but see `PUBLIC_SITE_ENV` below. |
+| `PUBLIC_SITE_ENV` | no | Set to `production` to enable the **production build gate** (`astro.config.mjs`): the build fails loudly, before writing `dist/`, if `PUBLIC_REPO_URL` is unset or still the template placeholder, or if `PUBLIC_WEBAPP_URL` is set to a non-`https://` value. `.github/workflows/deploy.yml` sets this for the real production build; a plain local `bun run build`/`bun run test` (including in this template's own repo, which still has the placeholder) leaves it unset, so the template's own build/CI stays green. |
 
-Astro only exposes env vars prefixed `PUBLIC_` to `import.meta.env` in client/build output - see [Astro's env docs](https://docs.astro.build/en/guides/environment-variables/). There is no `.env.example` checked in here (only two optional, non-secret build-time vars) - set them directly in whatever builds this workspace; see `.github/workflows/deploy.yml` for how CI provides them in production.
+Astro only exposes env vars prefixed `PUBLIC_` to `import.meta.env` in client/build output - see [Astro's env docs](https://docs.astro.build/en/guides/environment-variables/). There is no `.env.example` checked in here (only a handful of optional, non-secret build-time vars) - set them directly in whatever builds this workspace; see `.github/workflows/deploy.yml` for how CI provides them in production.
 
 ## Commands
 
@@ -79,9 +81,9 @@ Astro publishes pages from `src/pages`. Static assets live in `public`.
 
 ## Deployment
 
-The build output in `website/dist` is a fully static site with no server islands or runtime-rendered routes - production deployment is a plain static file serve, not a runtime service. `infra/edge`'s Caddy stack bind-mounts `website/dist` read-only and serves it directly at `{$SITE_DOMAIN}` (see `infra/edge/docker-compose.yml` and `infra/edge/Caddyfile`) - there is no server process for this workspace in production, unlike `backend`.
+The build output in `website/dist` is a fully static site with no server islands or runtime-rendered routes - production deployment is a plain static file serve, not a runtime service. `infra/edge`'s Caddy stack bind-mounts the versioned `releases/` directory read-only and serves `website/dist` from whichever release the `current` symlink points at (see `infra/edge/docker-compose.yml` and `infra/edge/Caddyfile`) - there is no server process for this workspace in production, unlike `backend`.
 
-`.github/workflows/deploy.yml` builds this workspace in CI (`bun run build:website`, with `PUBLIC_WEBSITE_URL`/`PUBLIC_WEBAPP_URL` supplied as GitHub Actions variables - see `.github/workflows/README.md`) and rsyncs `website/dist` to the path `infra/edge` expects on the VPS. Rebuild and redeploy after either URL changes - they're baked in at build time, not read at runtime.
+`.github/workflows/deploy.yml` builds this workspace in CI (`bun run build:website`, with `PUBLIC_WEBSITE_URL`/`PUBLIC_WEBAPP_URL`/`PUBLIC_REPO_URL` supplied as GitHub Actions variables and `PUBLIC_SITE_ENV=production` set - see `.github/workflows/README.md` and "Env" above for what each one gates) and `rsync`s `website/dist` into that deploy's versioned release directory on the VPS. Rebuild and redeploy after any of these change - they're baked in at build time, not read at runtime.
 
 ### SSR upgrade path
 

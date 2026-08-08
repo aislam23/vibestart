@@ -15,13 +15,20 @@
  *   bun run secrets:generate -- --prod            # refuses unsafe prod defaults
  *   bun run secrets:generate -- --prod \
  *     --site-url=https://app.example.com \
- *     --api-external-url=https://api.example.com/auth/v1 \
- *     --public-url=https://api.example.com
+ *     --api-external-url=https://supabase.example.com/auth/v1 \
+ *     --public-url=https://supabase.example.com
  *
  * --site-url/--api-external-url/--public-url override the corresponding
  * .env.example values; without them, --prod validates whatever is already
  * set in .env.example (i.e. you can pre-edit .env.example instead of
  * passing flags).
+ *
+ * --api-external-url/--public-url MUST be the Supabase/Kong host
+ * (SUPABASE_DOMAIN), never the backend API's own host (API_DOMAIN) - GoTrue
+ * stamps API_EXTERNAL_URL as the `iss` claim on every token it issues, and
+ * infra/app/.env's SUPABASE_JWT_ISSUER must match it exactly. --prod
+ * rejects an API_DOMAIN-shaped value here (see looksLikeApiHostInsteadOfSupabaseHost
+ * below) as a guard against this exact mix-up.
  */
 
 import { randomBytes, createHmac } from "node:crypto";
@@ -96,7 +103,7 @@ function signApiKeyJwt(role: "anon" | "service_role", jwtSecret: string): string
   return `${signingInput}.${base64url(signature)}`;
 }
 
-function isConcreteHttpsUrl(value: string | undefined): boolean {
+export function isConcreteHttpsUrl(value: string | undefined): boolean {
   if (!value) return false;
   let url: URL;
   try {
@@ -111,8 +118,28 @@ function isConcreteHttpsUrl(value: string | undefined): boolean {
   return true;
 }
 
+/**
+ * The `iss` claim GoTrue stamps on tokens is derived from API_EXTERNAL_URL - it MUST be the public
+ * Supabase/Kong host (the one infra/edge's Caddyfile routes to `kong:8000`, see
+ * infra/edge/Caddyfile's `{$SUPABASE_DOMAIN}` block and infra/app/.env.example's
+ * SUPABASE_JWT_ISSUER comment), never the backend API's own host (`API_DOMAIN` in infra/edge) -
+ * those are two different Caddy hosts pointing at two different upstreams. A cheap heuristic catch
+ * for the most common copy-paste mistake: passing the API_DOMAIN value here instead of
+ * SUPABASE_DOMAIN. Not exhaustive (nothing stops a legitimately-named host containing "api" as
+ * part of a longer word), just a guard against the literal `api.` prefix mistake.
+ */
+function looksLikeApiHostInsteadOfSupabaseHost(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "api" || host.startsWith("api.");
+  } catch {
+    return false;
+  }
+}
+
 /** Checks the --prod-unsafe combinations. Returns a list of human-readable failures. */
-function validateProd(values: Map<string, string>): string[] {
+export function validateProd(values: Map<string, string>): string[] {
   const failures: string[] = [];
 
   const urlChecks: Array<[key: string, flag: string]> = [
@@ -130,15 +157,33 @@ function validateProd(values: Map<string, string>): string[] {
     }
   }
 
+  for (const [key, flag] of [
+    ["API_EXTERNAL_URL", "--api-external-url"],
+    ["SUPABASE_PUBLIC_URL", "--public-url"],
+  ] as const) {
+    const value = values.get(key);
+    if (looksLikeApiHostInsteadOfSupabaseHost(value)) {
+      failures.push(
+        `${key}=${value} - this looks like the backend API host (API_DOMAIN), not the Supabase/Kong ` +
+          `host (SUPABASE_DOMAIN). GoTrue stamps this URL as the \`iss\` claim on every token it issues, ` +
+          `and infra/app/.env.example's SUPABASE_JWT_ISSUER must match it exactly - point ${flag} at your ` +
+          `SUPABASE_DOMAIN (e.g. https://supabase.example.com), not API_DOMAIN.`,
+      );
+    }
+  }
+
   const smtpConfigured = Boolean(values.get("SMTP_HOST")?.trim());
   const autoconfirm = (values.get("ENABLE_EMAIL_AUTOCONFIRM") ?? "").trim().toLowerCase() === "true";
   const signupOpen = (values.get("DISABLE_SIGNUP") ?? "").trim().toLowerCase() !== "true";
 
-  if (autoconfirm && !smtpConfigured) {
+  // Autoconfirm-with-no-SMTP is only dangerous when signup is actually reachable - if
+  // DISABLE_SIGNUP=true, nobody can sign up at all, so there is no unverified-email path to guard
+  // against regardless of what ENABLE_EMAIL_AUTOCONFIRM is set to.
+  if (autoconfirm && !smtpConfigured && signupOpen) {
     failures.push(
-      "ENABLE_EMAIL_AUTOCONFIRM=true (-> GOTRUE_MAILER_AUTOCONFIRM) with no SMTP_HOST configured - " +
-        "signups would be auto-confirmed with no email verification at all. Set ENABLE_EMAIL_AUTOCONFIRM=false " +
-        "with working SMTP_* values, or disable signup.",
+      "ENABLE_EMAIL_AUTOCONFIRM=true (-> GOTRUE_MAILER_AUTOCONFIRM) with no SMTP_HOST configured and " +
+        "signup enabled - signups would be auto-confirmed with no email verification at all. Set " +
+        "ENABLE_EMAIL_AUTOCONFIRM=false with working SMTP_* values, or set DISABLE_SIGNUP=true.",
     );
   }
   if (signupOpen && !smtpConfigured) {
@@ -272,4 +317,8 @@ function main(): void {
   );
 }
 
-main();
+// Guarded so this module can be `import`ed for tests (see generate-secrets.test.ts) without
+// running main()'s process.exit-driven CLI flow.
+if (import.meta.main) {
+  main();
+}

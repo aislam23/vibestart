@@ -182,10 +182,14 @@ above, run by a human who has just read this section, gated by both
 
 **Numbered procedure:**
 
-1. Stop dependent services (backend, and anything else that writes to
-   this database) - `docker compose -f infra/edge/docker-compose.yml stop`
-   or however your backend is deployed. Postgres (`db`) itself stays up -
-   `restore.sh` needs a live connection to it.
+1. Stop dependent services (`backend`, and anything else that writes to
+   this database - the scheduler sibling process, if enabled, and any
+   worker) - `docker compose -f infra/app/docker-compose.yml stop backend`
+   (add `scheduler`/`worker` if those are running). Do **not** stop
+   `infra/edge` - it serves `webapp`/`website` static assets independently
+   of `db`, and stopping it only adds unrelated downtime; it will simply
+   proxy 502s for `API_DOMAIN` while `backend` is down. Postgres (`db`)
+   itself stays up - `restore.sh` needs a live connection to it.
 2. `make pre-restore-snapshot` - see "Pre-restore safety net" below.
 3. Run the restore (steps 1-4 above).
 4. **Verify application data**, not the pg_restore error log - see below.

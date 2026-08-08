@@ -1,27 +1,34 @@
-# Builds and publishes the backend image, then deploys both static sites
-# and the backend to the production VPS over SSH. Two jobs:
+# Builds and publishes the backend image, then deploys both static sites and the backend to the
+# production VPS over SSH. Three jobs:
 #
-# - `build-push`: builds backend/Dockerfile from the repo root (the Docker
-#   context, since the image copies packages/contracts alongside backend/ -
-#   see backend/Dockerfile's own comment) and pushes it to GHCR under
-#   `ghcr.io/<owner>/<repo>-backend`, tagged with the commit sha always, and
-#   additionally with the git tag + `latest` when triggered by a version
-#   tag (not on a manual workflow_dispatch run from an arbitrary branch -
-#   that should never silently become the new `latest`).
-# - `deploy` (environment: `production`, needs `build-push`): builds the
-#   webapp and website static bundles in CI, rsyncs both dist/ directories
-#   to the paths infra/edge's Caddy bind-mounts on the VPS, then over the
-#   same SSH connection: writes ONLY the fresh BACKEND_IMAGE tag to a small
-#   CI-owned `infra/app/image.env` file (atomically - write + rename, never
-#   a partial file readable mid-write), pulls the new image, runs the
-#   database migration, rolls `backend` to the new image, and polls its
-#   Docker healthcheck until it reports healthy or the job times out.
-#   `infra/app/.env` (the real secrets file) is never written by this
-#   workflow - see infra/app/README.md and .env.example for how it's
-#   provisioned once, by hand, on first deploy.
+# - `validate`: resolves exactly what commit is being deployed and refuses to proceed unless it is
+#   (a) a strict SemVer `v*` tag or an explicit, full-length commit SHA passed to
+#   `workflow_dispatch` - never an arbitrary branch ref - (b) reachable from `main` (an ancestor,
+#   via `git merge-base --is-ancestor`), and (c) has a successful `ci.yml` run recorded against it.
+#   Every `${{ github.* }}` value that reaches a `run:` step is routed through `env:` first and
+#   quoted, never interpolated directly into the shell string - see .github/workflows/README.md,
+#   "Why this workflow never interpolates `${{ github.* }}` directly into `run:`".
+# - `build-push` (needs `validate`): builds backend/Dockerfile from the repo root (the Docker
+#   context, since the image copies packages/contracts alongside backend/ - see backend/Dockerfile's
+#   own comment) at the validated commit and pushes it to GHCR under
+#   `ghcr.io/<owner>/<repo>-backend`, tagged with the commit sha only - `latest` and any version tag
+#   are deliberately NOT set here, only after the `production` environment gate below. Emits
+#   SLSA provenance + an SBOM (`provenance: mode=max`, `sbom: true`) and an attested build
+#   provenance record.
+# - `deploy` (environment: `production`, needs `validate` + `build-push`): builds the webapp and
+#   website static bundles in CI, promotes `latest`/the version tag to the digest just built (only
+#   now, behind the environment gate), rsyncs a VERSIONED release bundle (this commit's `infra/`,
+#   `Makefile`, and both `dist/` directories) to `releases/<sha>` on the VPS, then over the same SSH
+#   connection: pulls the backend image **by immutable digest**, runs the database migration as a
+#   one-shot service, rolls `backend`, polls its Docker healthcheck, and - only once that reports
+#   healthy - atomically flips the `current` symlink to the new release (so a failure never flips
+#   it at all - `current` stays pointed at the last release that actually passed its healthcheck).
+#   Any failure before that point rolls `backend` back to the previous image.
+#   `infra/app/.env` (the real secrets file) is never written by this workflow - see
+#   infra/app/README.md and .env.example for how it's provisioned once, by hand, on first deploy.
 #
-# See .github/workflows/README.md for every secret/variable this workflow
-# needs and how to provision them.
+# See .github/workflows/README.md for every secret/variable this workflow needs, how to provision
+# them, and the release layout on the VPS.
 
 name: Deploy
 
@@ -29,84 +36,202 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Full 40-character commit SHA to deploy. Must be an ancestor of main with a successful
+          ci.yml run recorded against it - arbitrary branch refs are not accepted.
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+# Only one deploy at a time, and never cancel one mid-flight (a cancelled deploy mid-rollout is
+# worse than a queued one waiting its turn - see the remote script's own `flock` for the
+# same guarantee against a manual `make app-*` on the box).
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    name: Validate deploy target
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0 # full history - needed for the ancestry check below
+
+      # Every value below that originates from the triggering event is read into `env:` first,
+      # never interpolated directly into the shell script - a tag/branch name is attacker-controlled
+      # input (anyone who can push a tag or ref controls its text) and direct `${{ }}` interpolation
+      # into `run:` is a known script-injection vector. Quoted throughout for the same reason.
+      - name: Resolve and validate deploy target
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          EVENT_SHA: ${{ github.sha }}
+          DISPATCH_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          sha_regex='^[0-9a-f]{40}$'
+          tag_regex='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            sha="$DISPATCH_SHA"
+            if ! [[ "$sha" =~ $sha_regex ]]; then
+              echo "::error::sha input must be a full 40-character lowercase-hex commit SHA" >&2
+              exit 1
+            fi
+            tag=""
+          elif [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+            if ! [[ "$tag" =~ $tag_regex ]]; then
+              echo "::error::tag '$tag' does not match strict SemVer vX.Y.Z[-pre] - refusing to deploy" >&2
+              exit 1
+            fi
+            sha="$EVENT_SHA"
+          else
+            echo "::error::unsupported trigger - expected a v* tag push or a workflow_dispatch sha input" >&2
+            exit 1
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify target is reachable from main
+        env:
+          TARGET_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main --quiet || true
+          if ! git rev-parse --verify --quiet "${TARGET_SHA}^{commit}" >/dev/null; then
+            echo "::error::commit $TARGET_SHA not found in this checkout's history" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$TARGET_SHA" origin/main; then
+            echo "::error::$TARGET_SHA is not an ancestor of origin/main - refusing to deploy an unmerged/unprotected commit" >&2
+            exit 1
+          fi
+
+      - name: Verify CI passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          count=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${TARGET_SHA}&status=success&per_page=1" \
+            --jq '.workflow_runs | length')
+          if [ "${count:-0}" -lt 1 ]; then
+            echo "::error::no successful ci.yml run found for commit $TARGET_SHA - refusing to deploy an unvalidated commit" >&2
+            exit 1
+          fi
+
   build-push:
     name: Build and push backend image
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
-      image: ${{ steps.tags.outputs.primary }}
+      image: ${{ steps.tags.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GHCR requires a lowercase image name; github.repository preserves
-      # whatever case the owner/repo actually have.
-      - name: Compute image tags
+      # GHCR requires a lowercase image name; github.repository preserves whatever case the
+      # owner/repo actually have.
+      - name: Compute image name
         id: tags
+        env:
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.validate.outputs.sha }}
         run: |
-          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-backend"
-          sha_tag="$image:${{ github.sha }}"
-          {
-            echo "tags<<TAGEOF"
-            echo "$sha_tag"
-            if [ "${{ github.ref_type }}" = "tag" ]; then
-              echo "$image:${{ github.ref_name }}"
-              echo "$image:latest"
-            fi
-            echo "TAGEOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "primary=$sha_tag" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          image="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')-backend"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$image:$TARGET_SHA" >> "$GITHUB_OUTPUT"
 
+      # Tagged with the commit SHA only - `latest` and any version tag are promoted to this same
+      # digest in the `deploy` job, only after the `production` environment gate passes.
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: backend/Dockerfile
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.tags.outputs.sha_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   deploy:
     name: Deploy to production
-    needs: build-push
+    needs: [validate, build-push]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
       - name: Setup bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # PUBLIC_*/VITE_* build-time env - see .github/workflows/README.md for
-      # what each one maps to (webapp/.env.example, website's
-      # PUBLIC_WEBSITE_URL/PUBLIC_WEBAPP_URL usage in website/src/pages/index.astro).
+      # PUBLIC_*/VITE_* build-time env - see .github/workflows/README.md for what each one maps to
+      # (webapp/.env.example, website's PUBLIC_WEBSITE_URL/PUBLIC_WEBAPP_URL usage in
+      # website/src/pages/index.astro). PUBLIC_SITE_ENV=production additionally makes website's
+      # build fail loudly if PUBLIC_WEBAPP_URL/the template's own placeholder repo URL was never
+      # replaced - see website/astro.config.mjs and website/README.md, "Production build gate".
       - name: Build webapp
         working-directory: webapp
         env:
@@ -120,7 +245,33 @@ jobs:
         env:
           PUBLIC_WEBSITE_URL: ${{ vars.PUBLIC_WEBSITE_URL }}
           PUBLIC_WEBAPP_URL: ${{ vars.PUBLIC_WEBAPP_URL }}
+          PUBLIC_REPO_URL: ${{ vars.PUBLIC_REPO_URL }}
+          PUBLIC_SITE_ENV: production
         run: bun run build
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only a real version-tag deploy promotes `latest` - a workflow_dispatch redeploy of an
+      # older, already-validated commit (e.g. for a manual rollback-forward) must never silently
+      # become the new `latest` that a fresh `docker compose pull` would pick up elsewhere.
+      - name: Promote latest/version tags to the built digest
+        if: needs.validate.outputs.tag != ''
+        id: promote
+        env:
+          IMAGE: ${{ needs.build-push.outputs.image }}
+          DIGEST: ${{ needs.build-push.outputs.digest }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${TAG}" \
+            "${IMAGE}@${DIGEST}"
 
       - name: Configure SSH
         env:
@@ -130,69 +281,153 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          # Pinned ahead of time (`ssh-keyscan <host>`, stored as a secret),
-          # not re-scanned here - scanning at deploy time trusts whatever
-          # host key answers on first connect, which is exactly the MITM
-          # this pin exists to prevent. See .github/workflows/README.md.
+          # Pinned ahead of time (`ssh-keyscan <host>`, stored as a secret), not re-scanned here -
+          # scanning at deploy time trusts whatever host key answers on first connect, which is
+          # exactly the MITM this pin exists to prevent. See .github/workflows/README.md.
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Sync static builds
+      # Versioned release bundle - this commit's infra/ tree (compose files, Caddyfile), Makefile,
+      # and both static builds, all landing under releases/<sha> on the VPS. Never touches
+      # infra/app/.env (the real secrets file, stable across releases) or any other *.env - only
+      # what's tracked in git. See .github/workflows/README.md, "Release layout on the VPS".
+      - name: Sync versioned release bundle
         env:
           SSH_USER: ${{ vars.SSH_USER }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          TARGET_SHA: ${{ needs.validate.outputs.sha }}
         run: |
-          rsync_ssh="ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts"
-          # --delete: hashed, content-addressed filenames (see
-          # infra/edge/Caddyfile's immutable-cache rule) accumulate forever
-          # otherwise - a stale asset lingering is harmless but unbounded.
-          rsync -az --delete -e "$rsync_ssh" webapp/dist/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/webapp/dist/"
-          rsync -az --delete -e "$rsync_ssh" website/dist/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/website/dist/"
+          set -euo pipefail
+          ssh_opts="-i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts"
+          release_dir="$DEPLOY_PATH/releases/$TARGET_SHA"
 
+          # shellcheck disable=SC2086,SC2029
+          ssh $ssh_opts "$SSH_USER@$SSH_HOST" "mkdir -p '$release_dir'"
+          # shellcheck disable=SC2086
+          rsync -az --delete -e "ssh $ssh_opts" infra/ "$SSH_USER@$SSH_HOST:$release_dir/infra/"
+          # shellcheck disable=SC2086
+          rsync -az -e "ssh $ssh_opts" Makefile "$SSH_USER@$SSH_HOST:$release_dir/Makefile"
+          # --delete: hashed, content-addressed filenames (see infra/edge/Caddyfile's
+          # immutable-cache rule) accumulate forever otherwise - a stale asset lingering is
+          # harmless but unbounded.
+          # shellcheck disable=SC2086
+          rsync -az --delete -e "ssh $ssh_opts" webapp/dist/ "$SSH_USER@$SSH_HOST:$release_dir/webapp/dist/"
+          # shellcheck disable=SC2086
+          rsync -az --delete -e "ssh $ssh_opts" website/dist/ "$SSH_USER@$SSH_HOST:$release_dir/website/dist/"
+
+      # Order: docker login (GHCR_PULL_TOKEN - the VPS never assumes public packages) -> pull the
+      # backend image BY DIGEST -> run the one-shot `migrate` service -> roll `backend` -> poll its
+      # healthcheck -> only then flip the `current` symlink. Any failure before the flip restores
+      # the previous image, prints the new container's logs, and exits non-zero - `current` itself
+      # never needs restoring, since it's only ever touched after a healthy rollout (see the
+      # inline comments below for exactly what each guard does). `flock` serializes this against a
+      # concurrent manual `make app-*`/another deploy run on the same box.
       - name: Deploy backend
         env:
           SSH_USER: ${{ vars.SSH_USER }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
-          BACKEND_IMAGE: ${{ needs.build-push.outputs.image }}
+          TARGET_SHA: ${{ needs.validate.outputs.sha }}
+          BACKEND_IMAGE: ${{ needs.build-push.outputs.image }}@${{ needs.build-push.outputs.digest }}
+          GHCR_PULL_USER: ${{ vars.GHCR_PULL_USER }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
         run: |
+          # Intentional: DEPLOY_PATH/TARGET_SHA/BACKEND_IMAGE/GHCR_PULL_USER/GHCR_PULL_TOKEN expand
+          # client-side on purpose, to pin the exact validated values as literal env assignments
+          # for the remote `bash -s`, rather than trusting the remote shell's own environment.
+          # shellcheck disable=SC2029
           ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
             "$SSH_USER@$SSH_HOST" \
-            "DEPLOY_PATH='$DEPLOY_PATH' BACKEND_IMAGE='$BACKEND_IMAGE' bash -s" <<'REMOTE'
+            "DEPLOY_PATH='$DEPLOY_PATH' TARGET_SHA='$TARGET_SHA' BACKEND_IMAGE='$BACKEND_IMAGE' GHCR_PULL_USER='$GHCR_PULL_USER' GHCR_PULL_TOKEN='$GHCR_PULL_TOKEN' bash -s" <<'REMOTE'
           set -euo pipefail
           cd "$DEPLOY_PATH"
 
-          compose="docker compose -f infra/app/docker-compose.yml --env-file infra/app/.env --env-file infra/app/image.env"
+          release_dir="$DEPLOY_PATH/releases/$TARGET_SHA"
+          app_env="$DEPLOY_PATH/infra/app/.env"
+          image_env="$DEPLOY_PATH/infra/app/image.env"
+          lock_file="$DEPLOY_PATH/deploy.lock"
 
-          # Atomic: a concurrent `docker compose` read of image.env (this
-          # deploy racing a manual `make app-*` on the box) never sees a
-          # half-written file - write to a temp file in the same directory,
-          # then rename (POSIX rename is atomic on the same filesystem).
-          printf 'BACKEND_IMAGE=%s\n' "$BACKEND_IMAGE" > infra/app/image.env.tmp
-          mv infra/app/image.env.tmp infra/app/image.env
+          # Serialize against a concurrent deploy or a manual `make app-*` on this host - a second
+          # run started while one is in progress fails immediately instead of interleaving
+          # `docker compose`/symlink-flip calls.
+          exec 9>"$lock_file"
+          flock -n 9 || { echo "another deploy is already in progress on this host" >&2; exit 1; }
 
-          $compose pull backend
-          $compose run --rm backend bun run prisma:deploy
+          chmod 600 "$app_env" 2>/dev/null || true
+
+          echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GHCR_PULL_USER" --password-stdin
+
+          previous_image=""
+          [ -f "$image_env" ] && previous_image=$(sed -n 's/^BACKEND_IMAGE=//p' "$image_env")
+          previous_current_target=""
+          [ -L "$DEPLOY_PATH/current" ] && previous_current_target=$(readlink "$DEPLOY_PATH/current")
+
+          # Unique temp file in the same directory, then rename (POSIX rename is atomic on the
+          # same filesystem) - a concurrent `docker compose` read of image.env never sees a
+          # half-written file. Cleanup trap covers a failure between mktemp and the rename.
+          image_env_tmp=$(mktemp "${image_env}.tmp.XXXXXX")
+          trap 'rm -f "$image_env_tmp"' EXIT
+          printf 'BACKEND_IMAGE=%s\n' "$BACKEND_IMAGE" > "$image_env_tmp"
+          chmod 600 "$image_env_tmp"
+          mv "$image_env_tmp" "$image_env"
+          trap - EXIT
+
+          compose="docker compose -f $release_dir/infra/app/docker-compose.yml --env-file $app_env --env-file $image_env"
+
+          fail() {
+            echo "deploy of $TARGET_SHA failed: $1" >&2
+            $compose logs --tail 100 backend >&2 || true
+            if [ -n "$previous_image" ]; then
+              echo "rolling back backend to $previous_image" >&2
+              printf 'BACKEND_IMAGE=%s\n' "$previous_image" > "$image_env"
+              if [ -n "$previous_current_target" ] && [ -d "$DEPLOY_PATH/$previous_current_target" ]; then
+                prev_compose="docker compose -f $DEPLOY_PATH/$previous_current_target/infra/app/docker-compose.yml --env-file $app_env --env-file $image_env"
+                $prev_compose up -d backend || echo "rollback: failed to restore the previous backend container" >&2
+              fi
+            else
+              echo "no previous image on record - nothing to roll back to (first deploy on this host?)" >&2
+            fi
+            exit 1
+          }
+          trap 'fail "unexpected command failure"' ERR
+
+          $compose pull backend migrate
+          $compose run --rm migrate
           $compose up -d backend
 
           echo "Waiting for backend healthcheck..."
+          healthy=0
           for _ in $(seq 1 30); do
-            status=$(docker inspect --format '{{.State.Health.Status}}' vibestart-backend 2>/dev/null || echo "starting")
+            cid=$($compose ps -q backend)
+            status=$(docker inspect --format '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "starting")
             if [ "$status" = "healthy" ]; then
-              echo "backend is healthy"
-              exit 0
+              healthy=1
+              break
             fi
             sleep 2
           done
-          echo "backend did not become healthy in time" >&2
-          docker logs --tail 100 vibestart-backend >&2 || true
-          exit 1
+          trap - ERR
+          if [ "$healthy" != "1" ]; then
+            fail "backend did not report healthy within the poll budget"
+          fi
+
+          # Only now, after the new backend is confirmed healthy, make this release live - both
+          # writes above (image.env) and this one are tmp-file-then-rename, so a reader (including
+          # infra/edge's Caddy, which reads through this same symlink - see
+          # infra/edge/docker-compose.yml) never observes a half-updated target.
+          current_tmp=$(mktemp -u "$DEPLOY_PATH/current.tmp.XXXXXX")
+          trap 'rm -f "$current_tmp"' EXIT
+          ln -sfn "releases/$TARGET_SHA" "$current_tmp"
+          mv -T "$current_tmp" "$DEPLOY_PATH/current"
+          trap - EXIT
+
+          echo "deploy of $TARGET_SHA succeeded"
           REMOTE
 
-      # Caddy needs no action here: static file changes are picked up on
-      # the next request (no in-memory cache of file contents to reload -
-      # see infra/edge/Caddyfile's `file_server` directive), and the
-      # backend upstream is resolved by Docker DNS per-request, so
-      # recreating the `backend` container above needs no Caddy restart or
-      # config reload either.
+      # Caddy needs no action here: its bind mount is the STABLE `releases/` directory, and
+      # `releases/current` (flipped above) is an ordinary symlink *inside* that already-mounted
+      # tree - `file_server` re-resolves it on every request, no container recreate or config
+      # reload needed. See infra/edge/docker-compose.yml's volumes comment. A Caddy
+      # restart/`docker compose up` in infra/edge is only ever needed for a Caddyfile or edge `.env`
+      # change, which this workflow does not make.

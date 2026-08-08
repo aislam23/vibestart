@@ -1,22 +1,32 @@
 # Production compose stack for vibestart's own services - currently just the
-# Bun+Hono backend API. Not internet-facing on its own: it joins the shared
-# `edge` Docker network (so infra/edge's Caddy can reverse-proxy to it by
-# service name, see infra/edge/Caddyfile's `{$API_DOMAIN}` block) and the
-# `supabase` network (so it can reach Postgres/Kong by service name - see
-# infra/README.md's topology diagram). Both networks are provisioned by
+# Bun+Hono backend API. Not internet-facing on its own: it joins a narrow
+# `app_edge` Docker network (so infra/edge's Caddy can reverse-proxy to it by
+# service name, see infra/edge/Caddyfile's `{$API_DOMAIN}` block, without
+# putting the backend on the same broad `edge` network as every other
+# edge-facing container - see infra/app/README.md, "Network segmentation")
+# and the `supabase` network (so it can reach Postgres/Kong by service name -
+# see infra/README.md's topology diagram). All networks are provisioned by
 # their owning stacks (`make ensure-network`, `infra/supabase`), not by this
 # file - declared here as external only.
 #
 # The image itself (`backend/Dockerfile`) is built and pushed to GHCR by
 # `.github/workflows/deploy.yml`, not by this compose file - `BACKEND_IMAGE`
 # always points at an already-published `ghcr.io/<owner>/<repo>-backend:<tag>`
-# reference. Building locally for manual testing: see backend/README.md and
+# (or, from CI, an immutable `...-backend@sha256:<digest>`) reference.
+# Building locally for manual testing: see backend/README.md and
 # infra/app/README (docker build -f backend/Dockerfile -t vibestart-backend:local .).
+#
+# Credential isolation: `backend` only ever receives `DATABASE_URL` (the
+# least-privileged `backend_runtime` role) via the explicit `environment:`
+# list below - never `MIGRATE_DATABASE_URL` (the migration superuser). Only
+# the one-shot `migrate` service (profile `migrate`) receives
+# `MIGRATE_DATABASE_URL`; it is never part of `docker compose up`'s default
+# service set and never stays running. See infra/app/README.md, "Migrations".
 #
 # Usage:
 #   cp .env.example .env      # fill in real values (see infra/README.md, "First run")
 #   docker compose up -d      # from this directory (or `make app-up`)
-#   docker compose run --rm backend bun run prisma:deploy   # or `make app-migrate`
+#   docker compose run --rm migrate   # or `make app-migrate`
 
 name: app
 
@@ -30,8 +40,27 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    env_file:
-      - .env
+    # Explicit, enumerated env - NOT `env_file: .env` (which would hand the
+    # process every key in .env, including MIGRATE_DATABASE_URL, the
+    # migration superuser connection). Each entry maps 1:1 to
+    # backend/src/env.ts; keep this list in sync with that schema.
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      SUPABASE_URL: ${SUPABASE_URL:?SUPABASE_URL is required}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:?SUPABASE_JWT_SECRET is required}
+      SUPABASE_JWT_ISSUER: ${SUPABASE_JWT_ISSUER:-}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+      PORT: ${PORT:-3000}
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-20}
+      ADMIN_USERS_READ_RATE_LIMIT_MAX: ${ADMIN_USERS_READ_RATE_LIMIT_MAX:-120}
+      ADMIN_USERS_READ_RATE_LIMIT_WINDOW_SECONDS: ${ADMIN_USERS_READ_RATE_LIMIT_WINDOW_SECONDS:-60}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      TRUSTED_PROXY_CLIENT_IP_HEADER: ${TRUSTED_PROXY_CLIENT_IP_HEADER:-}
+      TRUSTED_PROXY_CLIENT_IP_POSITION: ${TRUSTED_PROXY_CLIENT_IP_POSITION:-}
+    # Exceeds SHUTDOWN_GRACE_SECONDS above (default 20s) so Docker's SIGKILL
+    # never races the app's own graceful-shutdown window.
+    stop_grace_period: 30s
     healthcheck:
       # No wget/curl in the oven/bun base image (Debian slim) - bun itself
       # (with its built-in fetch) is the only HTTP client guaranteed to be
@@ -55,7 +84,24 @@ services:
         max-size: "10m"
         max-file: "5"
     networks:
-      - edge
+      - app_edge
+      - supabase
+
+  # One-shot schema migration - `docker compose run --rm migrate` (or
+  # `make app-migrate`), never `up`. The only service in this stack that
+  # receives MIGRATE_DATABASE_URL (the supabase_admin superuser connection -
+  # see backend/README.md, "Runtime DB role"); `backend` above never sees it.
+  # `restart: "no"` and the `migrate` profile both keep it out of
+  # `docker compose up`'s default service set.
+  migrate:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required - e.g. ghcr.io/<owner>/<repo>-backend:latest}
+    restart: "no"
+    profiles:
+      - migrate
+    environment:
+      MIGRATE_DATABASE_URL: ${MIGRATE_DATABASE_URL:?MIGRATE_DATABASE_URL is required}
+    command: ["bun", "run", "prisma:deploy"]
+    networks:
       - supabase
 
   # Uncomment to run schedules (src/scheduler.ts) as a long-running sibling
@@ -86,11 +132,16 @@ services:
   #     - supabase
 
 networks:
-  # Provisioned independently of any single stack (`make ensure-network` /
-  # `docker network create edge`) - see infra/README.md.
-  edge:
+  # Narrow network shared by exactly `backend` and infra/edge's `caddy` -
+  # NOT the broad `edge` network that every other edge-facing container
+  # (kong, future services) also joins. Reduces the blast radius of a
+  # compromised backend: it can reach Caddy (to be reverse-proxied) but
+  # nothing else that happens to be on `edge`. See infra/app/README.md,
+  # "Network segmentation". Provisioned independently of any single stack
+  # (`make ensure-network` / `docker network create app_edge`).
+  app_edge:
     external: true
-    name: edge
+    name: app_edge
   # Provisioned by infra/supabase/docker-compose.yml (`name: supabase`) -
   # see infra/backup/docker-compose.yml for the same external-attach pattern.
   supabase:

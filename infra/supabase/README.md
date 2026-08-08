@@ -104,9 +104,17 @@ existing `.env`.
   ```bash
   bun run secrets:generate -- --prod \
     --site-url=https://app.example.com \
-    --api-external-url=https://api.example.com/auth/v1 \
-    --public-url=https://api.example.com
+    --api-external-url=https://supabase.example.com/auth/v1 \
+    --public-url=https://supabase.example.com
   ```
+
+  `--api-external-url`/`--public-url` MUST be the Supabase/Kong host
+  (`SUPABASE_DOMAIN` - what `infra/edge/Caddyfile` routes to `kong:8000`),
+  never the backend API's own host (`API_DOMAIN`, routed to `backend:3000`)
+  - GoTrue stamps `API_EXTERNAL_URL` as the `iss` claim on every token it
+  issues, and `infra/app/.env`'s `SUPABASE_JWT_ISSUER` must match it
+  exactly. `--prod` rejects an API_DOMAIN-shaped value here as a guard
+  against this exact mix-up.
 - **`--force`** - regenerates an existing `.env` (dev or prod checks apply
   the same way). Backs up the current `.env` first; see "Rotating secrets"
   below for what to do with the backup.

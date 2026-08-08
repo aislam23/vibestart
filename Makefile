@@ -29,8 +29,9 @@ secrets-prod: ## Generate infra/supabase/.env for production (bun infra/supabase
 	cd "$(ROOT_DIR)" && bun infra/supabase/generate-secrets.ts --prod $(ARGS)
 
 .PHONY: ensure-network
-ensure-network: ## Create the shared `edge` Docker network if it doesn't already exist
+ensure-network: ## Create the shared `edge`/`app_edge` Docker networks if they don't already exist
 	@docker network inspect edge >/dev/null 2>&1 || docker network create edge
+	@docker network inspect app_edge >/dev/null 2>&1 || docker network create app_edge
 
 .PHONY: supabase-up
 supabase-up: ensure-network ## Start the Supabase stack
@@ -46,7 +47,7 @@ supabase-logs: ## Tail logs for the Supabase stack
 
 .PHONY: edge-up
 edge-up: ensure-network ## Start the Caddy edge stack
-	@mkdir -p "$(ROOT_DIR)/webapp/dist" "$(ROOT_DIR)/website/dist"
+	@mkdir -p "$(ROOT_DIR)/releases"
 	cd "$(EDGE_DIR)" && docker compose up -d
 
 .PHONY: edge-down
@@ -67,7 +68,7 @@ app-logs: ## Tail logs for the backend production stack
 
 .PHONY: app-migrate
 app-migrate: ## Apply backend/prisma/migrations against MIGRATE_DATABASE_URL (see infra/app/README.md)
-	$(APP_COMPOSE) run --rm backend bun run prisma:deploy
+	$(APP_COMPOSE) run --rm migrate
 
 # up/down use $(MAKE) calls in a single recipe body (not prerequisites) so
 # the steps run strictly sequentially even under `make -j` - prerequisites

@@ -90,6 +90,25 @@ async function waitForHealth() {
   throw new Error(`Timed out waiting for ${url}`)
 }
 
+async function waitForDockerHealthy() {
+  for (let attempt = 1; attempt <= 30; attempt += 1) {
+    const result = spawnSync('docker', ['inspect', '--format', '{{.State.Health.Status}}', containerName], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+
+    if (result.status === 0 && result.stdout.toString().trim() === 'healthy') {
+      process.stdout.write(`Backend Docker smoke: container healthcheck reports healthy (${containerName})\n`)
+      return
+    }
+
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_000))
+  }
+
+  process.stderr.write(`Timed out waiting for ${containerName}'s Docker healthcheck to report healthy\n`)
+  spawnSync('docker', ['inspect', '--format', '{{json .State.Health}}', containerName], { stdio: 'inherit' })
+  throw new Error(`Timed out waiting for ${containerName}'s Docker healthcheck`)
+}
+
 try {
   run('docker', [...composeArgs, 'up', '-d', 'db_test'], { cwd: backendRoot })
   await waitForHealthyDbTest()
@@ -110,6 +129,29 @@ try {
     networkName,
     '-p',
     `127.0.0.1:${hostPort}:3000`,
+    // Mirrors infra/app/docker-compose.yml's production constraints on `backend`, so this smoke
+    // test exercises the actual container contract (read-only rootfs, no privilege escalation,
+    // non-root user, the exact compose healthcheck command, matching stop-timeout) - not just
+    // "the image boots" under a permissive `docker run`.
+    '--read-only',
+    '--tmpfs',
+    '/tmp',
+    '--security-opt',
+    'no-new-privileges:true',
+    '--user',
+    'bun',
+    '--stop-timeout',
+    '30',
+    '--health-cmd',
+    "bun -e \"fetch('http://127.0.0.1:3000/health/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+    '--health-interval',
+    '10s',
+    '--health-timeout',
+    '5s',
+    '--health-retries',
+    '5',
+    '--health-start-period',
+    '15s',
     '-e',
     'PORT=3000',
     '-e',
@@ -126,6 +168,7 @@ try {
   ])
 
   await waitForHealth()
+  await waitForDockerHealthy()
 } finally {
   spawnSync('docker', ['rm', '-f', containerName], { stdio: 'ignore' })
   spawnSync('docker', [...composeArgs, 'down', '--volumes', '--remove-orphans'], {

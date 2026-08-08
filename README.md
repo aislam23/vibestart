@@ -95,9 +95,10 @@ requirement. See `website/README.md` ("Practice") and `webapp/README.md`.
 
 Production is one VPS running four Docker Compose stacks (`infra/supabase`, `infra/app`,
 `infra/edge`, `infra/backup`) plus two static builds (`webapp/dist`, `website/dist`) that Caddy
-serves directly. Deploys run in GitHub Actions (`.github/workflows/deploy.yml`): build the backend
-image → push to GHCR → SSH to the VPS → sync static builds → run migrations → roll the backend
-container → poll its healthcheck.
+serves from a versioned release directory. Deploys run in GitHub Actions
+(`.github/workflows/deploy.yml`): validate the target commit → build the backend image by digest →
+push to GHCR → SSH to the VPS → sync a versioned release bundle → run migrations → roll the backend
+container → poll its healthcheck → flip the release live.
 
 Start with `docs/DEPLOYMENT.md` for the full runbook (DNS, firewall, secrets, first-deploy order,
 rollback); `infra/README.md` has the network topology and VPS bootstrap checklist;

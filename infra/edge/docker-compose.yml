@@ -1,8 +1,25 @@
 # Caddy reverse-proxy stack for vibestart - the only stack with ports
 # published to the internet. Attaches to the shared `edge` Docker network
-# as external - the network itself is provisioned independently (`make
-# ensure-network` / `docker network create edge`), not owned by this stack.
-# See README.md for the topology and first-run runbook.
+# (to reach infra/supabase's `kong`) and the narrower `app_edge` network
+# (to reach infra/app's `backend`, without putting `backend` on the same
+# broad `edge` network kong and any future service also join - see
+# infra/app/README.md, "Network segmentation") as external - both networks
+# are provisioned independently (`make ensure-network` /
+# `docker network create edge` / `docker network create app_edge`), not
+# owned by this stack. See README.md for the topology and first-run runbook.
+#
+# Static build roots are bind-mounted through the STABLE `releases/` parent
+# directory (not through a symlink as the bind source itself - a bind mount
+# resolves a symlinked source once, at container start, so a later symlink
+# flip would silently go unnoticed without a container recreate). Instead,
+# `../../releases` (real, never-replaced directory) is mounted whole, and
+# `releases/current` - the symlink .github/workflows/deploy.yml's release
+# process flips atomically after a new backend passes its healthcheck, see
+# docs/DEPLOYMENT.md, "Release layout on the VPS" - lives *inside* that
+# mounted tree. Caddy's `file_server` re-resolves `current` on every
+# request (an ordinary in-container symlink lookup, not a new host mount),
+# so a new release's static files show up with no action needed here; only
+# a Caddyfile/env change needs `docker compose up` again in this directory.
 #
 # Usage:
 #   cp .env.example .env   # fill in real domains + ACME email
@@ -36,21 +53,18 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Static builds, read-only - Caddy only ever serves these, never
-      # writes them. Bind mounts (not named volumes) so `webapp`/`website`
-      # builds land here directly from the repo checkout on the VPS.
-      # `create_host_path: false` means these directories must already
-      # exist (created by the deploy checklist / `make edge-up`'s mkdir) -
-      # Compose refuses to silently create them, so a missing build output
-      # fails loudly instead of masking a broken deploy as an empty mount.
+      # writes them. `../../releases` is the STABLE parent directory the
+      # deploy workflow writes every versioned release into
+      # (`releases/<sha>/{webapp,website}/dist`) plus the `releases/current`
+      # symlink it flips after a successful backend healthcheck - see the
+      # comment above and docs/DEPLOYMENT.md, "Release layout on the VPS".
+      # `create_host_path: false` means this directory must already exist
+      # (created by the deploy checklist / `make edge-up`'s mkdir) - Compose
+      # refuses to silently create it, so a missing release directory fails
+      # loudly instead of masking a broken deploy as an empty mount.
       - type: bind
-        source: ../../webapp/dist
-        target: /srv/webapp
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ../../website/dist
-        target: /srv/website
+        source: ../../releases
+        target: /srv
         read_only: true
         bind:
           create_host_path: false
@@ -73,15 +87,23 @@ services:
         max-file: "5"
     networks:
       - edge
+      - app_edge
 
 networks:
   # Provisioned independently of any single stack (`make ensure-network` /
-  # `docker network create edge`) so infra/supabase's kong service, this
-  # stack, and (from T5) backend can all attach to it as external in any
-  # start/stop order - no stack owns or creates it anymore.
+  # `docker network create edge`) so infra/supabase's kong service and this
+  # stack can attach to it as external in any start/stop order - no stack
+  # owns or creates it anymore. `backend` (infra/app) deliberately does NOT
+  # join this network - see `app_edge` below.
   edge:
     external: true
     name: edge
+  # Narrow network shared by exactly this `caddy` service and infra/app's
+  # `backend` - see infra/app/README.md, "Network segmentation", for why
+  # backend isn't on the broad `edge` network above instead.
+  app_edge:
+    external: true
+    name: app_edge
 
 volumes:
   caddy-data:

@@ -24,31 +24,39 @@ directly and talks to Supabase on `http://localhost:54321` - see the
                             |
                         80/443 (+443/udp)
                             v
-                    +----------------+
-                    |  caddy (edge)  |
-                    +----------------+
+                +---------------------------+
+                |  caddy (edge + app_edge)  |
+                +---------------------------+
                     /       |       \  \
                    /        |        \  \
       {$APP_DOMAIN}  {$SITE_DOMAIN}  {$API_DOMAIN}   {$SUPABASE_DOMAIN}
-      root /srv/webapp  root /srv/website  |               |
-      (bind mount)      (bind mount)       v               v
-                                    reverse_proxy    reverse_proxy
-                                    backend:3000      kong:8000
-                                    (edge network,     (edge network,
-                                     T5)                infra/supabase)
+      root /srv/current/  root /srv/current/  |               |
+        webapp/dist         website/dist      v               v
+      (bind mount of      (bind mount of  reverse_proxy    reverse_proxy
+       releases/, see      releases/)     backend:3000      kong:8000
+       docker-compose.yml)                (app_edge          (edge network,
+                                            network, T5)       infra/supabase)
 ```
 
-The `edge` Docker network is provisioned independently of any single stack
-(`make ensure-network`, or `docker network create edge` directly) - this
-stack, `infra/supabase`'s `kong` service, and (starting T5) `backend` all
-attach to it as `external: true` from their own compose projects, so any
-stack can start or stop in any order without owning or having to
-pre-create the network for the others. Caddy reaches the others by
-service name. `db`, `auth`, `rest`, `realtime`, `storage`, `meta`, and
-`studio` never join `edge` and stay unreachable from outside their own
-compose network - Studio in particular is reached **only** through Kong's
-`dashboard` route (basic-auth), never proxied directly (see
-`infra/supabase/README.md`).
+Two Docker networks are provisioned independently of any single stack
+(`make ensure-network`, or `docker network create edge && docker network
+create app_edge` directly):
+
+- **`edge`** - this stack and `infra/supabase`'s `kong` service attach as
+  `external: true` from their own compose projects.
+- **`app_edge`** - this stack and (starting T5) `infra/app`'s `backend`
+  service attach as `external: true`. Kept separate from `edge`
+  deliberately, so `backend` can't reach `kong` (or any future
+  edge-facing service) over the network layer if compromised - see
+  `infra/app/README.md`, "Network segmentation".
+
+Either way, any stack can start or stop in any order without owning or
+having to pre-create either network for the others. Caddy reaches the
+others by service name. `db`, `auth`, `rest`, `realtime`, `storage`,
+`meta`, and `studio` never join `edge`/`app_edge` and stay unreachable
+from outside their own compose network - Studio in particular is reached
+**only** through Kong's `dashboard` route (basic-auth), never proxied
+directly (see `infra/supabase/README.md`).
 
 ## First run on a VPS
 
@@ -78,11 +86,11 @@ compose network - Studio in particular is reached **only** through Kong's
    This repo does not do that edit for you - `infra/supabase` stays
    self-contained until you deliberately wire it to the edge.
 4. **Bring the stacks up**: `make up` from the repo root (this also runs
-   `make ensure-network`, which creates the `edge` network if it doesn't
-   exist yet). The `edge` network is provisioned independently of any one
-   stack, so `infra/supabase` and `infra/edge` can each be started or
-   stopped in either order, on a fresh VPS or afterwards - there's no
-   longer a required first-boot order between them.
+   `make ensure-network`, which creates both the `edge` and `app_edge`
+   networks if they don't exist yet). Both networks are provisioned
+   independently of any one stack, so `infra/supabase`, `infra/app`, and
+   `infra/edge` can each be started or stopped in any order, on a fresh
+   VPS or afterwards - there's no required first-boot order between them.
 5. Bring the edge stack up with `docker compose up -d --wait` (or
    `make edge-up`, which does the same) so the command doesn't return until
    Caddy's healthcheck passes, then run an external HTTPS smoke check
@@ -117,10 +125,13 @@ HTTP/2 otherwise.
   for a stricter setup, put Studio behind an IP allow-list or a VPN
   instead of relying on framing/basic-auth alone (pattern only - not
   implemented here).
-- **Deploying webapp/website builds**: `webapp/dist` and `website/dist`
-  are bind-mounted read-only - never include symlinks in a dist artifact
-  you deploy there, since a symlink can point outside the mounted
-  directory and Caddy will happily serve whatever it resolves to.
+- **Deploying webapp/website builds**: the `releases/` directory
+  (containing every deploy's `webapp/dist`/`website/dist` plus the
+  `current` symlink `.github/workflows/deploy.yml` flips - see
+  `docker-compose.yml`'s volumes comment) is bind-mounted read-only -
+  never include symlinks in a dist artifact you deploy there, since a
+  symlink can point outside the mounted directory and Caddy will happily
+  serve whatever it resolves to.
 
 ## Staging
 
