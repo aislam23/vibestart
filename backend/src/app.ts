@@ -12,10 +12,18 @@ import { createUsersModule } from './modules/users'
 type CreateAppOptions = {
   env: AppEnv
   prisma: DbClient
+  /** Clock for the readiness-probe cache below. Overridable in tests; defaults to `Date.now`. */
+  now?: () => number
 }
 
-export function createApp({ env, prisma }: CreateAppOptions) {
-  const authContext = createAuthContext({ db: prisma, supabaseJwtSecret: env.SUPABASE_JWT_SECRET })
+const readinessCacheMs = 5_000
+
+export function createApp({ env, prisma, now = Date.now }: CreateAppOptions) {
+  const authContext = createAuthContext({
+    db: prisma,
+    supabaseJwtSecret: env.SUPABASE_JWT_SECRET,
+    supabaseJwtIssuer: env.SUPABASE_JWT_ISSUER,
+  })
   const users = createUsersModule({
     db: prisma,
     env,
@@ -60,13 +68,42 @@ export function createApp({ env, prisma }: CreateAppOptions) {
     return c.json({ status: 'ok' })
   })
 
-  app.get('/health/ready', async (c) => {
+  // Caches the DB probe for `readinessCacheMs` (in-process) so a flood of readiness requests -
+  // this endpoint stays public behind the edge proxy, see backend/README.md - cannot multiply
+  // `SELECT 1` queries against Postgres. `inFlightProbe` also collapses concurrent callers that
+  // land during a cache miss onto a single query instead of one each.
+  let cachedReadiness: { status: 'ok' | 'unavailable'; expiresAt: number } | undefined
+  let inFlightProbe: Promise<'ok' | 'unavailable'> | undefined
+
+  async function probeDatabase(): Promise<'ok' | 'unavailable'> {
     try {
       await prisma.$queryRaw`SELECT 1`
-      return c.json({ status: 'ok' }, 200)
+      return 'ok'
     } catch {
-      return c.json({ status: 'unavailable' }, 503)
+      return 'unavailable'
     }
+  }
+
+  async function checkReadiness(): Promise<'ok' | 'unavailable'> {
+    const currentTime = now()
+    if (cachedReadiness && cachedReadiness.expiresAt > currentTime) {
+      return cachedReadiness.status
+    }
+
+    if (!inFlightProbe) {
+      inFlightProbe = probeDatabase().finally(() => {
+        inFlightProbe = undefined
+      })
+    }
+
+    const status = await inFlightProbe
+    cachedReadiness = { status, expiresAt: now() + readinessCacheMs }
+    return status
+  }
+
+  app.get('/health/ready', async (c) => {
+    const status = await checkReadiness()
+    return c.json({ status }, status === 'ok' ? 200 : 503)
   })
 
   app.route('/api/users', users.userRoutes)

@@ -30,18 +30,30 @@ export const defaultJobLockTimeoutMs = 15 * 60 * 1000
  *
  * The other cost is an open transaction - and therefore a held connection - for the whole run, on
  * top of the connection the job itself uses.
+ *
+ * `job` receives an `AbortSignal` - the runner's way of telling a job to wind down. It fires when
+ * this lock expires mid-run (see above: the job is still executing JS after Prisma has already
+ * rolled its transaction back) and when `signal` (an external, e.g. process-shutdown, signal) is
+ * aborted. It is cooperative, not forcible: a job that never checks it never learns to stop.
  */
 export async function runWithJobLock<Result>(
   prisma: Pick<DbClient, '$transaction'>,
   jobName: string,
-  job: () => Promise<Result>,
-  { timeoutMs = defaultJobLockTimeoutMs }: { timeoutMs?: number } = {},
+  job: (signal: AbortSignal) => Promise<Result>,
+  { timeoutMs = defaultJobLockTimeoutMs, signal: parentSignal }: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<{ ranHere: true; result: Result } | { ranHere: false }> {
   // Set when the transaction actually starts. Time spent queueing for a connection is not time
   // holding the lock, so it must not count: on a saturated pool Prisma rejects with the same
   // error code before the transaction exists, and blaming that on the lock would send an
   // operator after a timeout instead of after the pool.
   let lockHeldSince: number | undefined
+
+  const controller = new AbortController()
+  const forwardAbort = () => controller.abort(parentSignal?.reason)
+  if (parentSignal) {
+    if (parentSignal.aborted) forwardAbort()
+    else parentSignal.addEventListener('abort', forwardAbort, { once: true })
+  }
 
   try {
     return await prisma.$transaction(
@@ -54,7 +66,7 @@ export async function runWithJobLock<Result>(
 
         if (!acquired) return { ranHere: false as const }
 
-        return { ranHere: true as const, result: await job() }
+        return { ranHere: true as const, result: await job(controller.signal) }
       },
       { timeout: timeoutMs },
     )
@@ -66,11 +78,14 @@ export async function runWithJobLock<Result>(
       const elapsedMs = Date.now() - lockHeldSince
 
       if (elapsedMs >= timeoutMs) {
+        controller.abort(new Error(`job lock for "${jobName}" expired`))
         throw new JobLockExpiredError(jobName, timeoutMs, elapsedMs, error)
       }
     }
 
     throw error
+  } finally {
+    if (parentSignal) parentSignal.removeEventListener('abort', forwardAbort)
   }
 }
 
@@ -102,6 +117,35 @@ function isPrismaTransactionFailure(error: unknown) {
   )
 }
 
+/** Postgres's `lock_not_available` error code, raised when a statement hits `lock_timeout`. */
+const POSTGRES_LOCK_NOT_AVAILABLE = '55P03'
+
+export function isLockTimeoutError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  // The `@prisma/adapter-pg` driver adapter wraps a raw-query failure as
+  // `PrismaClientKnownRequestError` with its own generic `code: 'P2010'` ("raw query failed") -
+  // the actual Postgres error code only shows up nested (`meta.driverAdapterError`, itself
+  // provider- and version-shaped) or in the message text Prisma composes
+  // ("Raw query failed. Code: `55P03`. Message: ..."). The message text is the one place this
+  // is stable across Prisma/driver-adapter versions, so it is checked first; the structured
+  // fields are kept as a fallback in case a future version simplifies this.
+  const candidate = error as {
+    code?: unknown
+    message?: unknown
+    meta?: { code?: unknown; message?: unknown; driverAdapterError?: { cause?: { code?: unknown } } }
+  }
+  const messageContains = (value: unknown) =>
+    typeof value === 'string' && value.includes(POSTGRES_LOCK_NOT_AVAILABLE)
+
+  return (
+    candidate.code === POSTGRES_LOCK_NOT_AVAILABLE ||
+    candidate.meta?.code === POSTGRES_LOCK_NOT_AVAILABLE ||
+    candidate.meta?.driverAdapterError?.cause?.code === POSTGRES_LOCK_NOT_AVAILABLE ||
+    messageContains(candidate.message) ||
+    messageContains(candidate.meta?.message)
+  )
+}
+
 /**
  * Serializes every admin role change behind one Postgres advisory lock, held for the transaction.
  *
@@ -110,8 +154,27 @@ function isPrismaTransactionFailure(error: unknown) {
  * before either write commits, and both proceed - leaving zero admins. Taking this lock first
  * forces role changes through one at a time, so the second request in any race sees the first
  * one's already-committed write.
+ *
+ * `SET LOCAL lock_timeout` bounds how long a request waits behind another one already holding this
+ * lock, scoped to this transaction only so it never leaks onto unrelated statements sharing a
+ * pooled connection. A request that waits past it gets Postgres error 55P03
+ * (`lock_not_available`), which the caller (`admin-users-repository.ts`) maps to `409 CONFLICT`
+ * with a `Retry-After` header instead of hanging.
  */
-export async function acquireUserRoleMutationLock(tx: Pick<DbClient, '$executeRaw'>) {
+const lockTimeoutPattern = /^\d+(ms|s|min|h|d)?$/
+
+export async function acquireUserRoleMutationLock(
+  tx: Pick<DbClient, '$executeRaw' | '$executeRawUnsafe'>,
+  { lockTimeout = '5s' }: { lockTimeout?: string } = {},
+) {
+  // Postgres's `SET` does not accept a bind parameter for the value in every driver path, so this
+  // goes through `$executeRawUnsafe` instead of a tagged template - safe here only because
+  // `lockTimeout` is always one of this module's own literals, never external input. The regex
+  // guards that invariant instead of trusting it silently.
+  if (!lockTimeoutPattern.test(lockTimeout)) {
+    throw new Error(`Invalid lock timeout "${lockTimeout}"`)
+  }
+  await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${lockTimeout}'`)
   // `$executeRaw`, not `$queryRaw`: `pg_advisory_xact_lock` returns `void`, a column type the
   // driver adapter cannot deserialize into a result row.
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'users:role-mutation'}))`

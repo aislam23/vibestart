@@ -26,9 +26,11 @@ new models; `profiles` is the one exception, since its id mirrors `auth.users.id
 
 | Variable | Required | Notes |
 | --- | --- | --- |
-| `DATABASE_URL` | yes | Points at the Supabase Postgres instance, e.g. `postgresql://postgres:PASSWORD@localhost:54322/postgres`. Copy the password from `infra/supabase/.env`. |
+| `DATABASE_URL` | yes | Points at the Supabase Postgres instance, e.g. `postgresql://postgres:PASSWORD@localhost:54322/postgres`. Copy the password from `infra/supabase/.env`. This is the connection the *running app* uses - see "Runtime DB role" below for switching it to a least-privileged role in production. |
+| `MIGRATE_DATABASE_URL` | no | Superuser connection `prisma migrate`/`prisma migrate deploy` use for schema changes. Falls back to `DATABASE_URL` when unset. See "Runtime DB role". |
 | `SUPABASE_URL` | yes | Public URL of the Supabase stack (Kong), e.g. `http://localhost:54321`. |
 | `SUPABASE_JWT_SECRET` | yes, ≥32 chars | Shared HS256 secret GoTrue/PostgREST/Realtime/Storage all sign and verify with. Copy `JWT_SECRET` from `infra/supabase/.env`. |
+| `SUPABASE_JWT_ISSUER` | no | The `iss` claim GoTrue stamps on tokens it issues. Defaults to `${SUPABASE_URL}/auth/v1`. In production this must equal GoTrue's *external* auth URL, e.g. `https://supabase.example.com/auth/v1`, not an internal/Docker hostname. |
 | `SERVICE_ROLE_KEY` | no | Only needed once a module calls Supabase's admin API directly. Never expose to a browser client. |
 | `PORT` | no, default `3000` | |
 | `CORS_ORIGINS` | no | Comma-separated exact browser origins (no wildcards, no paths); must be HTTPS-only when `NODE_ENV=production`. |
@@ -44,8 +46,10 @@ Copy `backend/.env.example` to `backend/.env` for local development.
 1. The browser signs up/logs in directly against Supabase Auth (GoTrue, via `infra/supabase`) and
    gets back a Supabase-issued access token (HS256 JWT).
 2. The browser sends that token as `Authorization: Bearer <jwt>` to the backend.
-3. `src/modules/auth-context` verifies the signature with `SUPABASE_JWT_SECRET`, requires
-   `aud`/`role` to be `authenticated` and the token to be unexpired, and reads `sub` as the user id.
+3. `src/modules/auth-context` verifies the signature with `SUPABASE_JWT_SECRET`, requires `iss` to
+   match `SUPABASE_JWT_ISSUER` (binding verification to this specific Supabase project, not just to
+   "any HS256 token signed with the shared secret"), `aud`/`role` to be `authenticated`, `iss`/`aud`/
+   `sub`/`iat`/`exp` to all be present, and the token to be unexpired, and reads `sub` as the user id.
 4. On first sight of a `sub` with no `profiles` row, it provisions one (`role: user`, `displayName`
    from the JWT's `user_metadata.display_name` if present) - this replaces a database trigger on
    `auth.users`, since GoTrue owns that schema and backend tests must run without it.
@@ -62,13 +66,23 @@ There are no cookies and no `/api/auth/*` routes on the backend - CORS runs with
 (`src/modules/auth-context/middleware.ts`), which runs after `requireAuth` and checks the
 already-fresh `c.var.user.role`:
 
-- `GET /api/admin/metrics` - `{ totalUsers, totalAdmins, newUsersLast7Days }`.
-- `GET /api/admin/users` - paginated, searches email and display name, rate-limited independently
-  (`ADMIN_USERS_READ_RATE_LIMIT_MAX`/`_WINDOW_SECONDS`) keyed by administrator id.
+- `GET /api/admin/metrics` - `{ totalUsers, totalAdmins, newUsersLast7Days }`. `totalAdmins` counts
+  only *active* administrators - `profiles` joined with `auth.users` - not bare `profiles` rows; see
+  "Recovery" below for the one case that excludes.
+- `GET /api/admin/users` - paginated, searches email and display name (bounded `ILIKE` scan - fine
+  for a small user base; at real scale, add a trigram index (`pg_trgm`) or another search strategy,
+  and move the rate limiter's in-memory state to something shared once this runs on more than one
+  backend instance), rate-limited independently (`ADMIN_USERS_READ_RATE_LIMIT_MAX`/`_WINDOW_SECONDS`)
+  keyed by administrator id.
 - `PATCH /api/admin/users/:userId/role` - changes a user's role inside a transaction serialized by
   a Postgres advisory lock (`acquireUserRoleMutationLock`, `src/db.ts`), so two concurrent role
-  changes can never leave zero administrators. Rejects self-demotion and demoting the last
-  administrator with `409 CONFLICT`.
+  changes can never leave zero administrators. Re-authorizes the actor *inside* that lock (reloads
+  their profile and checks it is still `admin`) before applying anything, so a request that already
+  passed `requireAuth`/`requireAdmin` before a concurrent demotion committed cannot still mutate a
+  role once it is that actor's turn. The lock wait itself is bounded (`SET LOCAL lock_timeout =
+  '5s'`); a request that waits longer than that gets `409 CONFLICT` with `Retry-After: 5` instead of
+  hanging. Also rejects self-demotion and demoting the last *active* administrator (see above) with
+  `409 CONFLICT`.
 
 **No session revocation on a role change.** The source template this repository is based on
 revokes sessions after a role change, because it issues and stores its own session tokens. This
@@ -81,6 +95,15 @@ writes to it. The one exception is
 `src/modules/users/infrastructure/admin-users-repository.ts`, which reads `auth.users` with a
 raw, read-only SQL join for the admin directory only; nowhere else in the backend touches that
 table.
+
+**Recovery.** Because the admin directory and the last-admin invariant both use an inner join
+against `auth.users`, a `profiles` row whose `auth.users` row was deleted (the auth-side account is
+gone, but nothing here mirrors that deletion) becomes invisible to both - it can silently stop
+counting as "an administrator remains" and stop showing up in `GET /api/admin/users`. If that
+leaves zero *active* administrators, promote one directly through `psql`:
+`UPDATE profiles SET role = 'admin' WHERE id = '<uuid>';`. A periodic job that reconciles orphaned
+`profiles` rows against `auth.users` would be a good first real entry in the empty background-job
+registry below - not implemented here.
 
 ## Background jobs
 
@@ -95,19 +118,62 @@ processes that can run it:
 
 All three ship **empty** - this template has no session table to sweep (Supabase Auth owns
 sessions) and no other recurring work yet, so an install that never needs one pays nothing for it.
-Uncomment the commented example in `jobs.ts` (and a runner) once a real job exists. `scheduler.ts`
-and `worker.ts` take a Postgres advisory lock (`runWithJobLock`, `src/db.ts`) before a locked run,
-so a rolling deploy or a scaled-out worker cannot run the same job twice; the copy that loses the
-race logs that it skipped. Run any job by hand: `bun run --cwd backend start:cron -- <job>`. See
-the doc comments in `src/jobs.ts`, `src/scheduler.ts`, and `src/worker.ts` for lock timeouts and
-the trade-offs between the three runners - the mechanism is a direct port of the source template's
-`docs/BACKGROUND_JOBS.md`, only the starter registry (empty here) differs.
+Uncomment the commented example in `jobs.ts` (and a runner) once a real job exists.
+
+**Locking is the default for every runner, not something each one has to remember.** The registry
+in `jobs.ts` takes a Postgres advisory lock (`runWithJobLock`, `src/db.ts`) around every job by
+default, whether it is triggered by `cron.ts` (one shot), `scheduler.ts` (an in-process timer), or
+`worker.ts` (a loop) - so a rolling deploy, a scaled-out worker, or two overlapping provider-timer
+triggers of the same cron job cannot run the same job twice; the copy that loses the race logs that
+it skipped. A job opts out of locking, once, on its own definition in `jobs.ts` - `{ run, parallel:
+true }` - only when it is demonstrably safe to run more than once at a time (already idempotent, or
+serialized by something else); a plain `(runtime, now, signal) => Promise<void>` function is always
+locked.
+
+**Jobs receive an `AbortSignal`.** Every job's third argument aborts when its lock/transaction times
+out mid-run (the lock is gone, but the job's own code keeps executing until it awaits something
+that fails) and when the runner is shutting down. It is cooperative, not forcible - a job that never
+checks it (or never passes it down to whatever it awaits) never learns to stop, so write jobs that
+are idempotent and that do check it. `scheduler.ts`'s and `worker.ts`'s shutdown waits for
+in-flight jobs are themselves bounded by `SHUTDOWN_GRACE_SECONDS`: aborting the signal only *asks* a
+job to stop, so a job that ignores it does not hang the whole process shutdown - the runner logs an
+error and proceeds once the grace period elapses.
+
+Run any job by hand: `bun run --cwd backend start:cron -- <job>`. See the doc comments in
+`src/jobs.ts`, `src/scheduler.ts`, and `src/worker.ts` for lock timeouts and the trade-offs between
+the three runners - the mechanism is a direct port of the source template's
+`docs/BACKGROUND_JOBS.md`, only the starter registry (empty here) and the locking-by-default policy
+differ.
 
 ```bash
 bun run --cwd backend start:cron -- <job>
 bun run --cwd backend start:scheduler
 bun run --cwd backend start:worker
 ```
+
+## Runtime DB role
+
+The running application should connect as a least-privileged Postgres role, not the migration
+superuser. The `backend_runtime_role` migration creates `backend_runtime`: CRUD (no DDL) on every
+table in `public` (current and future, via `ALTER DEFAULT PRIVILEGES`), and read-only access to
+exactly the `auth.users` columns the admin directory's join needs (`id`, `email`) - nothing else,
+and never write access, since GoTrue owns that table.
+
+The role is created `NOLOGIN`, so applying the migration alone does not switch anything over. To
+activate it:
+
+```sql
+ALTER ROLE backend_runtime LOGIN PASSWORD '<generated>';
+```
+
+Generate `<generated>` yourself (e.g. `openssl rand -base64 32`) and run that statement once,
+as a superuser, against the target database - `bun run secrets:generate` does **not** manage this
+password. Then point `DATABASE_URL` at `backend_runtime` with that password, and set
+`MIGRATE_DATABASE_URL` to the superuser connection so `prisma migrate`/`prisma migrate deploy` keep
+working (see the Env table above). The integration test suite
+(`bun run test:backend:integration`) activates and exercises this role automatically against the
+throwaway `db_test` database, so `backend_runtime`'s privileges are covered by CI (see Testing
+below), not just by this migration's SQL.
 
 ## Dev loop
 
@@ -152,20 +218,30 @@ Three layers, each cheaper and faster than the next:
   provider SDKs; cross-module imports only through a module's `index.ts`; `packages/contracts` must
   not import backend, client, framework, or provider code).
 - **Integration** - `bun run --cwd backend test:integration` (root alias:
-  `bun run test:backend:integration`). Starts a throwaway Postgres (`backend/docker-compose.test.yml`,
-  service `db_test`, port `127.0.0.1:54329` - **not** the dev Supabase stack in `infra/supabase`,
-  port `54322`), applies `prisma/migrations`, runs every `*.integration.test.ts` file against it,
-  then tears the container down with `docker compose down --volumes` (the one place in the
-  repository a `-v` teardown is correct: `db_test` never holds anything worth keeping). Not part of
-  the default `bun run test` chain - it needs Docker and takes longer, so CI calls it as its own
-  step. `db_test` gets a minimal stub `auth.users(id, email)` table
-  (`backend/scripts/test-db-init`) instead of running real Supabase Auth, just enough for the admin
-  directory's read-only join to work against real Postgres; see the comment in that SQL file for
-  why.
+  `bun run test:backend:integration`, **CI must run this as its own step** - it needs Docker and
+  takes longer than the unit suite). Starts a throwaway Postgres
+  (`backend/docker-compose.test.yml`, service `db_test`, port `127.0.0.1:54329` - **not** the dev
+  Supabase stack in `infra/supabase`, port `54322`), applies `prisma/migrations` as the migration
+  superuser, activates the `backend_runtime` role (see "Runtime DB role" above) and runs every
+  `*.integration.test.ts` file's app-facing requests through it, then tears the container down with
+  `docker compose down --volumes` (the one place in the repository a `-v` teardown is correct:
+  `db_test` never holds anything worth keeping). `backend/scripts/test-integration.mjs` refuses to
+  run against anything that does not parse as `db_test`'s exact loopback host/port/database shape
+  (override only with `DESTRUCTIVE_TEST_ACK=yes` and a loopback host), and creates a sentinel row it
+  re-checks immediately before that teardown, so a misconfigured `TEST_DATABASE_URL` cannot point
+  this script's one destructive step at the wrong database. `db_test` gets a minimal stub
+  `auth.users(id, email)` table (`backend/scripts/test-db-init`) instead of running real Supabase
+  Auth, just enough for the admin directory's read-only join to work against real Postgres; see the
+  comment in that SQL file for why.
 - **Docker smoke** - `bun run --cwd backend smoke:docker` (root alias:
   `bun run smoke:backend:docker`). Builds `backend/Dockerfile`, runs the image against `db_test`,
   and asserts `GET /health/ready` returns `200` - the same check a container orchestrator's
   readiness probe would make.
+
+`GET /health/ready` caches its database probe for 5 seconds in-process (and collapses concurrent
+callers during a cache miss onto one query) so a flood of readiness requests cannot multiply
+`SELECT 1` queries; the endpoint itself stays public, behind the edge proxy like the rest of the
+API - the cache is what bounds the database load, not an auth check.
 
 ## Architecture
 

@@ -10,6 +10,17 @@ import {
 
 const runtime = {} as BackendRuntime
 
+function lockingRuntime({ acquired }: { acquired: boolean }) {
+  const calls = { transactions: 0 }
+  const prisma = {
+    $transaction: async (run: (tx: unknown) => Promise<unknown>) => {
+      calls.transactions += 1
+      return run({ $queryRaw: async () => [{ acquired }] })
+    },
+  }
+  return { calls, runtime: { prisma } as unknown as BackendRuntime }
+}
+
 describe('the production registry ships empty', () => {
   test('lists no jobs', () => {
     expect(backgroundJobNames()).toEqual([])
@@ -30,18 +41,85 @@ describe('the production registry ships empty', () => {
 })
 
 describe('createBackgroundJobRegistry', () => {
-  test('runs a registered job and passes the runtime and now through', async () => {
+  test('locks a plain-function job by default: it only runs once the advisory lock is acquired', async () => {
     const calls: unknown[] = []
     const now = new Date('2026-04-08T12:00:00.000Z')
+    const { runtime: lockedRuntime, calls: lockCalls } = lockingRuntime({ acquired: true })
     const { run } = createBackgroundJobRegistry({
-      noop: async (rt, jobNow) => {
-        calls.push([rt, jobNow])
+      noop: async (rt, jobNow, signal) => {
+        calls.push([rt, jobNow, signal])
       },
     })
 
-    await run('noop', runtime, now)
+    const outcome = await run('noop', lockedRuntime, now)
 
-    expect(calls).toEqual([[runtime, now]])
+    expect(lockCalls.transactions).toBe(1)
+    expect(outcome).toMatchObject({ ranHere: true })
+    expect(calls).toHaveLength(1)
+    const [[rt, jobNow, signal]] = calls as [[unknown, Date, AbortSignal]]
+    expect(rt).toBe(lockedRuntime)
+    expect(jobNow).toBe(now)
+    expect(signal).toBeInstanceOf(AbortSignal)
+  })
+
+  test('skips a plain-function job, and never calls it, while its lock is held elsewhere', async () => {
+    const calls: unknown[] = []
+    const { runtime: lockedRuntime } = lockingRuntime({ acquired: false })
+    const { run } = createBackgroundJobRegistry({
+      noop: async () => {
+        calls.push('ran')
+      },
+    })
+
+    const outcome = await run('noop', lockedRuntime)
+
+    expect(outcome).toEqual({ ranHere: false })
+    expect(calls).toEqual([])
+  })
+
+  test('a `parallel: true` job runs unlocked, without ever touching the database', async () => {
+    const calls: unknown[] = []
+    // No `.prisma` at all - if this job touched the lock, this would throw.
+    const noPrismaRuntime = {} as BackendRuntime
+    const { run } = createBackgroundJobRegistry({
+      warm: { run: async (rt, now, signal) => { calls.push([rt, now, signal]) }, parallel: true },
+    })
+
+    const outcome = await run('warm', noPrismaRuntime)
+
+    expect(outcome).toEqual({ ranHere: true })
+    expect(calls).toHaveLength(1)
+  })
+
+  test('a definition-object job without `parallel` still locks by default', async () => {
+    const { runtime: lockedRuntime, calls } = lockingRuntime({ acquired: true })
+    let ran = false
+    const { run } = createBackgroundJobRegistry({
+      job: { run: async () => { ran = true } },
+    })
+
+    await run('job', lockedRuntime)
+
+    expect(calls.transactions).toBe(1)
+    expect(ran).toBe(true)
+  })
+
+  test('an explicit timeoutMs override at call time wins over the job definition default', async () => {
+    let observedTimeout: number | undefined
+    const prisma = {
+      $transaction: async (run: (tx: unknown) => Promise<unknown>, options?: { timeout?: number }) => {
+        observedTimeout = options?.timeout
+        return run({ $queryRaw: async () => [{ acquired: true }] })
+      },
+    }
+    const lockedRuntime = { prisma } as unknown as BackendRuntime
+    const { run } = createBackgroundJobRegistry({
+      job: { run: async () => {}, timeoutMs: 1_000 },
+    })
+
+    await run('job', lockedRuntime, undefined, { timeoutMs: 5_000 })
+
+    expect(observedTimeout).toBe(5_000)
   })
 
   test('lists every registered job name', () => {

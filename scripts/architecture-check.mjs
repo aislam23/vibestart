@@ -2,15 +2,39 @@ import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// Known limitation: this check is regex-based, not a real parser. It is deliberately conservative
+// (broad patterns, a few dedicated bypass fixtures in architecture-check.test.mjs) rather than
+// exhaustive - a determined rewrite of an import statement can still slip past it. The upgrade
+// path, if that ever matters more than the simplicity of a dependency-free script, is an AST walk
+// (e.g. via `typescript`'s own parser) instead of pattern matching source text.
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 // `collectSourceFiles` below returns [] for a directory that does not exist yet (ENOENT), so
 // listing `webapp/src` and `website/src` here before either workspace has source files is safe -
 // they simply contribute zero files to this check until a later task adds them.
 const sourceRoots = ['backend/src', 'packages/contracts/src', 'webapp/src', 'website/src']
 const sourceExtension = /\.(?:[cm]?[jt]sx?)$/
-const importPattern = /(?:^|\n)\s*(?:import|export)\s+(?:type\s+)?(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]/g
-const runtimeModulePattern = /\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/g
-const applicationForbiddenPackages = ['@prisma/', 'hono', 'react', 'react-native', 'expo-', 'jose']
+// Anchored on `^`/`\n`/`;`, not just `^`/`\n`: an `import`/`export ... from` declaration is valid
+// JS/TS syntax anywhere in a module's top-level statement sequence (it is hoisted), including
+// packed onto the same physical line after another statement with a `;` - `const x = 1; import
+// {Prisma} from '@prisma/client'` is not a syntax error. Anchoring on line start alone missed it.
+const importPattern = /(?:^|\n|;)\s*(?:import|export)\s+(?:type\s+)?(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]/g
+// Tolerates a comment between `import`/`require` and the specifier, e.g. `import(/* lazy */ 'pg')`.
+// Built from plain strings, not a `String.raw` template literal, because the second pattern below
+// needs a literal backtick in its source and `String.raw` cannot produce one via escape.
+const commentOrWhitespace = '(?:\\s|/\\*[\\s\\S]*?\\*/|//[^\\n]*)*'
+const runtimeModulePattern = new RegExp(
+  '\\b(?:import|require)\\s*\\(' + commentOrWhitespace + '[\'"]([^\'"]+)[\'"]' + commentOrWhitespace + '\\)',
+  'g',
+)
+// A template-literal specifier - `import(`pg`)`, or worse `import(`${x}`)` - cannot be resolved by
+// any text-matching check, string-literal or AST: flag it outright rather than silently passing it
+// through unchecked.
+const dynamicImportTemplateLiteralPattern = new RegExp(
+  '\\b(?:import|require)\\s*\\(' + commentOrWhitespace + '`',
+  'g',
+)
+const DYNAMIC_TEMPLATE_LITERAL_SPECIFIER = '<dynamic-import-template-literal>'
+const applicationForbiddenPackages = ['@prisma/', 'hono', 'react', 'react-native', 'expo-', 'jose', 'pg']
 const contractForbiddenPackages = ['@prisma/', 'hono', 'react', 'react-native', 'expo-', 'jose']
 const transportForbiddenPackages = ['@prisma/', 'jose', 'pg']
 
@@ -31,6 +55,7 @@ export function checkArchitectureSources(files) {
         })
       }
 
+      checkUnresolvableDynamicImport(imported.specifier, report)
       checkBackendLayers(normalizedPath, imported.specifier, report)
       checkBackendModuleBoundary(normalizedPath, imported.specifier, report)
       checkClientBoundary(normalizedPath, imported.specifier, report)
@@ -167,6 +192,14 @@ function checkClientBoundary(filePath, specifier, report) {
   }
 }
 
+function checkUnresolvableDynamicImport(specifier, report) {
+  if (specifier !== DYNAMIC_TEMPLATE_LITERAL_SPECIFIER) return
+  report(
+    'dynamic-import-unresolvable',
+    'dynamic import()/require() with a template-literal specifier cannot be statically verified; use a string literal.',
+  )
+}
+
 function checkContracts(filePath, specifier, report) {
   if (!filePath.startsWith('packages/contracts/src/')) return
 
@@ -212,6 +245,15 @@ function staticImports(source) {
       })
     }
   }
+
+  for (const match of source.matchAll(dynamicImportTemplateLiteralPattern)) {
+    const matchEnd = (match.index ?? 0) + match[0].length
+    imports.push({
+      specifier: DYNAMIC_TEMPLATE_LITERAL_SPECIFIER,
+      line: source.slice(0, matchEnd).split('\n').length,
+    })
+  }
+
   return imports
 }
 
@@ -238,7 +280,14 @@ function normalizePath(filePath) {
 }
 
 function packageMatches(specifier, packagePrefix) {
-  if (packagePrefix.endsWith('/')) return specifier.startsWith(packagePrefix)
+  // Two different prefix styles: a scoped-package prefix like `@prisma/` (only ever a path
+  // separator before the rest of the name) and a hyphenated-family prefix like `expo-` (the family
+  // member's own name continues directly after the hyphen, e.g. `expo-router` - no `/` involved).
+  // Treating both the same as "must be followed by `/`" made `expo-` match nothing at all:
+  // `'expo-router'.startsWith('expo-/')` is false.
+  if (packagePrefix.endsWith('/') || packagePrefix.endsWith('-')) {
+    return specifier.startsWith(packagePrefix)
+  }
   return specifier === packagePrefix || specifier.startsWith(`${packagePrefix}/`)
 }
 

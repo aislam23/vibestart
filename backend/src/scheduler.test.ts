@@ -1,77 +1,65 @@
 import { expect, spyOn, test } from 'bun:test'
 
 import { runScheduledJob, startSchedules, type ScheduleEntry } from './scheduler'
-import type { BackgroundJobName } from './jobs'
+import type { BackgroundJobName, JobRunOutcome } from './jobs'
 import type { BackendRuntime } from './runtime'
 
-function runtimeWithLock(options: { acquired: boolean }) {
-  const calls = { transactions: 0 }
-
-  const prisma = {
-    $transaction: async (run: (tx: unknown) => Promise<unknown>) => {
-      calls.transactions += 1
-      return run({
-        $queryRaw: async () => [{ acquired: options.acquired }],
-      })
-    },
-    $queryRaw: async () => [{ '?column?': 1 }],
-  }
-
-  return { calls, runtime: { prisma } as unknown as BackendRuntime }
+function fakeRuntime() {
+  return {} as BackendRuntime
 }
 
 // The production job registry ships empty (see jobs.ts), so no real BackgroundJobName exists to
 // reference here. These fixtures stand in for a job that would exist once a product adds one; the
-// tests below inject a fake `runJob` rather than depending on the real (empty) registry.
+// tests below inject a fake `runJob` rather than depending on the real (empty) registry. Locking
+// is `jobs.ts`'s responsibility now (see jobs.test.ts and cron.test.ts for that mechanism) -
+// `runJob` here already returns the locked-or-skipped outcome, the same as `runBackgroundJob` does.
 const pingJob = 'db:ping' as BackgroundJobName
 const pingEntry: ScheduleEntry = { expression: '* * * * *', job: pingJob }
 
-test('a scheduled job runs when this process wins the lock', async () => {
-  const { calls, runtime } = runtimeWithLock({ acquired: true })
+test('a scheduled job runs when runJob reports it ran', async () => {
+  const runtime = fakeRuntime()
   const jobCalls: string[] = []
-  const runJob = async (jobName: string) => {
+  const runJob = async (jobName: string): Promise<JobRunOutcome> => {
     jobCalls.push(jobName)
+    return { ranHere: true }
   }
 
   await runScheduledJob(runtime, pingEntry, { runJob })
 
-  expect(calls.transactions).toBe(1)
   expect(jobCalls).toEqual([pingJob])
 })
 
 test('a scheduled job is skipped while another process holds the lock', async () => {
   // Two copies of the scheduler are normal during a rolling deploy; the second must do nothing
   // rather than run the same job twice.
-  const { runtime } = runtimeWithLock({ acquired: false })
+  const runtime = fakeRuntime()
   const log = spyOn(console, 'log').mockImplementation(() => {})
   const jobCalls: string[] = []
-  const runJob = async (jobName: string) => {
+  const runJob = async (jobName: string): Promise<JobRunOutcome> => {
     jobCalls.push(jobName)
+    return { ranHere: false }
   }
 
   try {
     await runScheduledJob(runtime, pingEntry, { runJob })
 
     expect(log).toHaveBeenCalledWith(`Scheduler skipped ${pingJob}: its lock is held elsewhere.`)
-    expect(jobCalls).toEqual([])
+    expect(jobCalls).toEqual([pingJob])
   } finally {
     log.mockRestore()
   }
 })
 
 test('a failing job is reported and does not escape the scheduler', async () => {
-  const runtime = {
-    prisma: {
-      $transaction: async () => {
-        throw new Error('database is unreachable')
-      },
-    },
-  } as unknown as BackendRuntime
+  const runtime = fakeRuntime()
+  const runJob = async (): Promise<JobRunOutcome> => {
+    throw new Error('database is unreachable')
+  }
   const error = spyOn(console, 'error').mockImplementation(() => {})
 
   try {
     // No rejection: the next tick must still happen.
-    await runScheduledJob(runtime, pingEntry)
+    await runScheduledJob(runtime, pingEntry, { runJob })
 
     expect(error).toHaveBeenCalled()
     expect(String(error.mock.calls[0]?.[0])).toContain(pingJob)
@@ -80,8 +68,27 @@ test('a failing job is reported and does not escape the scheduler', async () => 
   }
 })
 
+test('forwards the entry timeoutMs and an external signal through to runJob', async () => {
+  const runtime = fakeRuntime()
+  const controller = new AbortController()
+  const calls: unknown[] = []
+  const runJob = async (
+    jobName: string,
+    _rt: BackendRuntime,
+    _now?: Date,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<JobRunOutcome> => {
+    calls.push([jobName, options?.signal, options?.timeoutMs])
+    return { ranHere: true }
+  }
+
+  await runScheduledJob(runtime, { ...pingEntry, timeoutMs: 1_234 }, { runJob, signal: controller.signal })
+
+  expect(calls).toEqual([[pingJob, controller.signal, 1_234]])
+})
+
 test('schedules default to UTC so a server timezone cannot move production runs', () => {
-  const { runtime } = runtimeWithLock({ acquired: true })
+  const runtime = fakeRuntime()
   const { jobs } = startSchedules(runtime, [
     { expression: '0 3 * * *', job: pingJob },
     { expression: '0 3 * * *', job: pingJob, timeZone: 'Europe/Moscow' },
@@ -100,23 +107,14 @@ test('schedules default to UTC so a server timezone cannot move production runs'
 })
 
 test('a job that outran its lock is reported as a duplicate-run risk, not a generic failure', async () => {
-  // Prisma answers the same P2028 when the connection pool is saturated: it gives up before the
-  // transaction, and therefore before the lock, exists. Counting that wait as lock time told the
-  // operator to raise a timeout and warned about a duplicate run that could not have happened.
-  const runtime = {
-    prisma: {
-      // The transaction starts and the job runs; the commit is what fails, after the budget.
-      $transaction: async (run: (tx: unknown) => Promise<unknown>) => {
-        await run({ $queryRaw: async () => [{ acquired: true }] })
-        await Bun.sleep(30)
-        throw Object.assign(new Error('transaction expired'), { code: 'P2028' })
-      },
-      $queryRaw: async () => [{ '?column?': 1 }],
-    },
-  } as unknown as BackendRuntime
+  const runtime = fakeRuntime()
+  const runJob = async (): Promise<JobRunOutcome> => {
+    // `db.ts`'s own tests cover the classification logic; here we only need `runScheduledJob` to
+    // recognize and specially log a `JobLockExpiredError` it receives from `runJob`.
+    const { JobLockExpiredError } = await import('./db')
+    throw new JobLockExpiredError(pingJob, 10, 15, new Error('transaction expired'))
+  }
   const error = spyOn(console, 'error').mockImplementation(() => {})
-  const log = spyOn(console, 'log').mockImplementation(() => {})
-  const runJob = async () => {}
 
   try {
     await runScheduledJob(runtime, { ...pingEntry, timeoutMs: 10 }, { runJob })
@@ -125,49 +123,29 @@ test('a job that outran its lock is reported as a duplicate-run risk, not a gene
     expect(String(error.mock.calls[0]?.[0])).toContain('Another instance may have started it too')
   } finally {
     error.mockRestore()
-    log.mockRestore()
   }
 })
 
-test('a transaction failure inside a job is not blamed on the lock', async () => {
-  // The same P2028 arrives when the job runs its own nested transaction and that one times out.
-  // Telling the operator to raise the lock timeout would send them after the wrong thing.
-  const runtime = {
-    prisma: {
-      $transaction: async () => {
-        throw Object.assign(new Error('inner transaction expired'), { code: 'P2028' })
-      },
-    },
-  } as unknown as BackendRuntime
-  const error = spyOn(console, 'error').mockImplementation(() => {})
-
-  try {
-    await runScheduledJob(runtime, { ...pingEntry, timeoutMs: 60_000 })
-
-    expect(String(error.mock.calls[0]?.[0])).toBe(`Scheduler job ${pingJob} failed.`)
-  } finally {
-    error.mockRestore()
-  }
-})
-
-test('shutdown waits for a job that is already running', async () => {
+test('shutdown waits for a job that is already running, up to its grace period', async () => {
   // Stopping the timers is not enough: cutting a running job off would leave it half-done with
   // neither a success nor a failure recorded anywhere.
   const release = Promise.withResolvers<void>()
   let finished = false
-  const { runtime } = runtimeWithLock({ acquired: true })
-  const runJob = async () => {
+  const runtime = fakeRuntime()
+  const runJob = async (): Promise<JobRunOutcome> => {
     await release.promise
     finished = true
+    return { ranHere: true }
   }
   const log = spyOn(console, 'log').mockImplementation(() => {})
 
   try {
-    // Every second, so the tick lands inside the test rather than at the top of a minute.
+    // Every second, so the tick lands inside the test rather than at the top of a minute. A
+    // generous grace period so this test's own release, not the timeout, is what unblocks stop().
     const handle = startSchedules(
       runtime,
       [{ expression: '* * * * * *', job: pingJob }],
-      { runJob },
+      { runJob, shutdownGraceMs: 5_000 },
     )
     await Bun.sleep(1_100)
 
@@ -187,11 +165,41 @@ test('shutdown waits for a job that is already running', async () => {
   }
 })
 
+test('shutdown gives up after its grace period even if the job never finishes', async () => {
+  const runtime = fakeRuntime()
+  const runJob = async (): Promise<JobRunOutcome> => {
+    await new Promise(() => undefined) // never resolves; simulates a job that ignores its signal.
+    return { ranHere: true }
+  }
+  const log = spyOn(console, 'log').mockImplementation(() => {})
+  const error = spyOn(console, 'error').mockImplementation(() => {})
+
+  try {
+    const handle = startSchedules(
+      runtime,
+      [{ expression: '* * * * * *', job: pingJob }],
+      { runJob, shutdownGraceMs: 100 },
+    )
+    await Bun.sleep(1_100)
+
+    const startedAt = Date.now()
+    await handle.stop()
+    const elapsedMs = Date.now() - startedAt
+
+    expect(elapsedMs).toBeLessThan(1_000)
+    expect(error).toHaveBeenCalled()
+    expect(String(error.mock.calls.at(-1)?.[0])).toContain('grace period')
+  } finally {
+    log.mockRestore()
+    error.mockRestore()
+  }
+})
+
 test('one job can be scheduled more than once', () => {
   // A weekday/weekend split, or the same job in two timezones. croner throws on a repeated job
   // name, and that throw would happen at startup, before any signal handler exists - a supervised
   // process would then restart-loop with every schedule dead.
-  const { runtime } = runtimeWithLock({ acquired: true })
+  const runtime = fakeRuntime()
 
   const handle = startSchedules(runtime, [
     { expression: '0 9 * * 1-5', job: pingJob },

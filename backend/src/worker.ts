@@ -1,21 +1,15 @@
-import { defaultJobLockTimeoutMs, isJobLockExpiry, runWithJobLock } from './db'
+import { isJobLockExpiry } from './db'
 import { createBackendRuntime, type BackendRuntime } from './runtime'
-import { runBackgroundJob, type BackgroundJobName } from './jobs'
+import { runBackgroundJob, type BackgroundJobName, type JobRunOutcome } from './jobs'
 
 export type WorkerLoop = {
   job: BackgroundJobName
   /** Pause between iterations. Use this process when a minute between runs is too long. */
   intervalMs: number
   /**
-   * Take the same database lock the scheduler uses, so scaling the worker to several instances
-   * does not run this job twice. Off by default: most loop work is either idempotent or
-   * deliberately parallel, and the lock costs an open transaction per iteration.
-   */
-  singleInstance?: boolean
-  /**
-   * How long a `singleInstance` iteration may hold that lock. Exceeding it releases the lock
-   * mid-run and allows a duplicate on another instance, so leave headroom over the slowest
-   * expected iteration. Ignored when `singleInstance` is off.
+   * Overrides the job's own `timeoutMs` (`jobs.ts`) for how long an iteration of this loop may
+   * hold its lock. Exceeding it releases the lock mid-run and allows a duplicate on another
+   * instance, so leave headroom over the slowest expected iteration. Ignored for a `parallel` job.
    */
   timeoutMs?: number
 }
@@ -28,6 +22,10 @@ export type WorkerLoop = {
  * worker is a loop: use it when work must run more often than that, must run continuously, or
  * when several jobs should run side by side. Loops listed here run in parallel with each other.
  *
+ * Whether an iteration takes the advisory lock is the job's own choice (`parallel` on its
+ * definition in `jobs.ts`), not this loop's - so scaling the worker to several instances is safe
+ * by default without a per-loop flag to remember.
+ *
  * See docs/BACKGROUND_JOBS.md before switching this on.
  */
 export const workerLoops: WorkerLoop[] = [
@@ -35,23 +33,38 @@ export const workerLoops: WorkerLoop[] = [
 ]
 
 export type WorkerHandle = {
-  /** Resolves once every loop has finished the iteration it was in. */
-  stopped: Promise<void>
-  stop: () => void
+  /** Stops every loop after the iteration it is in (bounded by `shutdownGraceMs`), then resolves. */
+  stop: () => Promise<void>
 }
 
 /** What `runIteration` actually needs to run a job - `runBackgroundJob`'s signature. */
-type RunJob = (jobName: string, runtime: BackendRuntime, now?: Date) => Promise<void>
+type RunJob = (
+  jobName: string,
+  runtime: BackendRuntime,
+  now?: Date,
+  options?: { signal?: AbortSignal; timeoutMs?: number },
+) => Promise<JobRunOutcome>
+
+/** `SHUTDOWN_GRACE_SECONDS`'s own default (env.ts) - used only when a caller does not pass
+ * `shutdownGraceMs` explicitly, which `runWorker` below always does. */
+const defaultShutdownGraceMs = 20_000
 
 export function startWorkerLoops(
   runtime: BackendRuntime,
   loops: WorkerLoop[] = workerLoops,
-  { runJob = runBackgroundJob }: { runJob?: RunJob } = {},
+  {
+    runJob = runBackgroundJob,
+    shutdownGraceMs = defaultShutdownGraceMs,
+  }: { runJob?: RunJob; shutdownGraceMs?: number } = {},
 ): WorkerHandle {
   let running = true
   // One waker per sleeping loop. A single shared waker would only interrupt whichever loop
   // happened to fall asleep last, so a stop signal could hang for a full interval.
   const wakers = new Set<() => void>()
+  // Forwarded into every iteration - see `jobs.ts`'s doc comment on `signal`. Aborting only asks a
+  // job to wind down; it does not forcibly stop it, which is why `stop()` below still bounds its
+  // wait by `shutdownGraceMs` instead of trusting every job to honor the signal promptly.
+  const shutdownController = new AbortController()
 
   const sleep = (ms: number) =>
     new Promise<void>((resolve) => {
@@ -69,7 +82,7 @@ export function startWorkerLoops(
   async function runLoop(loop: WorkerLoop) {
     while (running) {
       try {
-        await runIteration(runtime, loop, runJob)
+        await runIteration(runtime, loop, runJob, shutdownController.signal)
       } catch (error) {
         // A failing iteration must not kill the loop; the next one tries again after the
         // usual pause.
@@ -81,29 +94,33 @@ export function startWorkerLoops(
     }
   }
 
-  const stopped = Promise.all(loops.map(runLoop)).then(() => undefined)
+  const allStopped = Promise.all(loops.map(runLoop)).then(() => undefined)
 
   return {
-    stopped,
-    stop: () => {
+    stop: async () => {
       running = false
+      shutdownController.abort(new Error('worker is shutting down'))
       for (const wake of [...wakers]) wake()
+
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      const timedOut = new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), shutdownGraceMs)
+      })
+      const finishedInTime = await Promise.race([allStopped.then(() => true as const), timedOut])
+      if (timeout) clearTimeout(timeout)
+
+      if (!finishedInTime) {
+        console.error(
+          `Worker shutdown grace period (${shutdownGraceMs}ms) elapsed with a loop still running; ` +
+            'proceeding with shutdown anyway.',
+        )
+      }
     },
   }
 }
 
-async function runIteration(runtime: BackendRuntime, loop: WorkerLoop, runJob: RunJob) {
-  if (!loop.singleInstance) {
-    await runJob(loop.job, runtime)
-    return
-  }
-
-  const outcome = await runWithJobLock(
-    runtime.prisma,
-    loop.job,
-    () => runJob(loop.job, runtime),
-    { timeoutMs: loop.timeoutMs ?? defaultJobLockTimeoutMs },
-  )
+async function runIteration(runtime: BackendRuntime, loop: WorkerLoop, runJob: RunJob, signal: AbortSignal) {
+  const outcome = await runJob(loop.job, runtime, undefined, { signal, timeoutMs: loop.timeoutMs })
 
   if (!outcome.ranHere) {
     console.log(`Worker skipped ${loop.job}: its lock is held elsewhere.`)
@@ -131,17 +148,23 @@ export async function runWorker(runtime: BackendRuntime) {
     return
   }
 
-  const handle = startWorkerLoops(runtime)
+  const handle = startWorkerLoops(runtime, workerLoops, {
+    shutdownGraceMs: runtime.env.SHUTDOWN_GRACE_SECONDS * 1000,
+  })
+  const stopped = Promise.withResolvers<void>()
+  let stopping = false
 
   const stop = (signal: string) => {
+    if (stopping) return
+    stopping = true
     console.log(`Worker received ${signal}; finishing the current iteration.`)
-    handle.stop()
+    void handle.stop().then(stopped.resolve)
   }
 
   process.on('SIGINT', () => stop('SIGINT'))
   process.on('SIGTERM', () => stop('SIGTERM'))
 
-  await handle.stopped
+  await stopped.promise
 }
 
 export async function main() {

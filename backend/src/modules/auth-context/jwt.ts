@@ -29,6 +29,7 @@ function secretKey(secret: string) {
 export async function verifySupabaseAccessToken(
   token: string | undefined,
   supabaseJwtSecret: string,
+  issuer: string,
 ): Promise<SupabasePrincipal> {
   if (!token) {
     throw new AuthContextFailure('missing_token', 'Authentication is required')
@@ -36,8 +37,18 @@ export async function verifySupabaseAccessToken(
 
   let payload: unknown
   try {
+    // Binds verification to this specific Supabase project, not just to "any HS256 token signed
+    // with the shared secret": `issuer` and `audience` must match this project's GoTrue, and
+    // `requiredClaims` rejects a token that is missing any of the claims the checks below rely on
+    // (a forged or malformed token that simply omits `exp`, for instance, must not verify as
+    // "never expires"). `clockTolerance` absorbs ordinary clock drift between this process and
+    // GoTrue without opening a large expiry/not-before window.
     ;({ payload } = await jwtVerify(token, secretKey(supabaseJwtSecret), {
       algorithms: ['HS256'],
+      issuer,
+      audience: 'authenticated',
+      requiredClaims: ['iss', 'aud', 'sub', 'iat', 'exp'],
+      clockTolerance: '5s',
     }))
   } catch {
     throw new AuthContextFailure('invalid_token', 'Access token is invalid or expired')

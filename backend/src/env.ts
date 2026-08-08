@@ -20,7 +20,7 @@ const optionalHttpHeaderNameSchema = z.preprocess((value) => {
   return trimmed === '' ? undefined : trimmed.toLowerCase()
 }, z.string().regex(/^[a-z0-9!#$%&'*+.^_`|~-]+$/).optional())
 
-const envSchema = z
+const rawEnvSchema = z
   .object({
     NODE_ENV: z.string().optional(),
     PORT: z.coerce.number().int().positive().default(3000),
@@ -30,6 +30,14 @@ const envSchema = z
     // JWTs GoTrue issues and, optionally, calls Supabase's admin API.
     SUPABASE_URL: z.string().url(),
     SUPABASE_JWT_SECRET: z.string().min(32),
+    // The `iss` claim GoTrue stamps on every access token it issues, so JWT verification can bind
+    // to this specific project instead of accepting any HS256 token signed with the shared secret.
+    // Defaults to Supabase's own convention (`${SUPABASE_URL}/auth/v1`); override only when GoTrue's
+    // external auth URL differs from SUPABASE_URL (e.g. it is reached through a different hostname
+    // than the one the backend uses for admin calls). In production this must equal GoTrue's
+    // external auth URL - e.g. `https://supabase.example.com/auth/v1`, not the internal/Docker
+    // hostname GoTrue is reachable at from the backend.
+    SUPABASE_JWT_ISSUER: optionalStringSchema,
     SERVICE_ROLE_KEY: optionalStringSchema,
     CORS_ORIGINS: z
       .string()
@@ -49,11 +57,20 @@ const envSchema = z
     TRUSTED_PROXY_CLIENT_IP_HEADER: optionalHttpHeaderNameSchema,
     TRUSTED_PROXY_CLIENT_IP_POSITION: z.enum(['first', 'last']).optional(),
   })
+
+const envSchema = rawEnvSchema
   .superRefine((env, ctx) => {
     validateSupabaseJwtSecret(env, ctx)
     validateCorsOrigins(env, ctx)
     validateTrustedProxy(env, ctx)
+    validateSupabaseJwtIssuer(env, ctx)
   })
+  .transform((env) => ({
+    ...env,
+    // Computed after validation so an invalid SUPABASE_URL is reported against SUPABASE_URL, not
+    // against a derived issuer the operator never typed.
+    SUPABASE_JWT_ISSUER: env.SUPABASE_JWT_ISSUER ?? `${env.SUPABASE_URL}/auth/v1`,
+  }))
 
 export type AppEnv = z.infer<typeof envSchema>
 
@@ -61,7 +78,7 @@ export function loadEnv(source: Record<string, string | undefined>) {
   return envSchema.parse(source)
 }
 
-function validateSupabaseJwtSecret(env: z.infer<typeof envSchema>, ctx: z.RefinementCtx) {
+function validateSupabaseJwtSecret(env: z.infer<typeof rawEnvSchema>, ctx: z.RefinementCtx) {
   if (env.NODE_ENV !== 'production') return
 
   if (isWeakSecret(env.SUPABASE_JWT_SECRET)) {
@@ -82,7 +99,21 @@ function isWeakSecret(secret: string) {
   )
 }
 
-function validateTrustedProxy(env: z.infer<typeof envSchema>, ctx: z.RefinementCtx) {
+function validateSupabaseJwtIssuer(env: z.infer<typeof rawEnvSchema>, ctx: z.RefinementCtx) {
+  if (!env.SUPABASE_JWT_ISSUER) return
+
+  try {
+    new URL(env.SUPABASE_JWT_ISSUER)
+  } catch {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['SUPABASE_JWT_ISSUER'],
+      message: 'SUPABASE_JWT_ISSUER must be a valid absolute URL',
+    })
+  }
+}
+
+function validateTrustedProxy(env: z.infer<typeof rawEnvSchema>, ctx: z.RefinementCtx) {
   if (env.TRUST_PROXY && !env.TRUSTED_PROXY_CLIENT_IP_HEADER) {
     ctx.addIssue({
       code: 'custom',
@@ -100,7 +131,7 @@ function validateTrustedProxy(env: z.infer<typeof envSchema>, ctx: z.RefinementC
   }
 }
 
-function validateCorsOrigins(env: z.infer<typeof envSchema>, ctx: z.RefinementCtx) {
+function validateCorsOrigins(env: z.infer<typeof rawEnvSchema>, ctx: z.RefinementCtx) {
   if (env.CORS_ORIGINS.length === 0) {
     ctx.addIssue({
       code: 'custom',

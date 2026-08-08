@@ -54,33 +54,64 @@ function createFakeDb(profiles = new Map<string, FakeProfile>()) {
 function signSupabaseToken(
   userId: string,
   email: string,
-  { secret = env.SUPABASE_JWT_SECRET, role = 'authenticated', aud = 'authenticated' } = {},
+  {
+    secret = env.SUPABASE_JWT_SECRET,
+    role = 'authenticated',
+    aud = 'authenticated',
+    issuer = env.SUPABASE_JWT_ISSUER,
+  } = {},
 ) {
   return new SignJWT({ email, aud, role, user_metadata: {} })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(userId)
     .setIssuedAt()
     .setExpirationTime('1h')
+    .setIssuer(issuer)
     .sign(new TextEncoder().encode(secret))
 }
 
-test('liveness is process-only while readiness checks the database', async () => {
+test('liveness is process-only while readiness checks the database, cached for a few seconds', async () => {
   let databaseAvailable = true
+  let now = 0
   const prisma = {
     $queryRaw: async () => {
       if (!databaseAvailable) throw new Error('database unavailable')
       return [{ '?column?': 1 }]
     },
   } as unknown as DbClient
-  const app = createApp({ env, prisma })
+  const app = createApp({ env, prisma, now: () => now })
 
   expect((await app.request('/health/live')).status).toBe(200)
   expect((await app.request('/health/ready')).status).toBe(200)
 
   databaseAvailable = false
 
+  // Still inside the readiness cache window: the cached "ok" answers without hitting the database.
+  expect((await app.request('/health/ready')).status).toBe(200)
+
+  now += 5_000
+
   expect((await app.request('/health/live')).status).toBe(200)
   expect((await app.request('/health/ready')).status).toBe(503)
+})
+
+test('caches the readiness probe so a flood of requests does not multiply database queries', async () => {
+  let now = 0
+  let queries = 0
+  const prisma = {
+    $queryRaw: async () => {
+      queries += 1
+      return [{ '?column?': 1 }]
+    },
+  } as unknown as DbClient
+  const app = createApp({ env, prisma, now: () => now })
+
+  await Promise.all(Array.from({ length: 10 }, () => app.request('/health/ready')))
+  expect(queries).toBe(1)
+
+  now += 5_000
+  await app.request('/health/ready')
+  expect(queries).toBe(2)
 })
 
 test('CORS preflight allows the standard mutation methods without enabling credentials', async () => {
@@ -176,6 +207,15 @@ test('rejects requests with no token, an invalid token, or a token signed with t
       })
     ).status,
   ).toBe(401)
+})
+
+test('rejects a token issued for a different Supabase project', async () => {
+  const app = createApp({ env, prisma: createFakeDb() })
+  const token = await signSupabaseToken('0196f6f8-6600-7000-8000-00000000000a', 'other-project@example.com', {
+    issuer: 'http://a-different-project.example.com/auth/v1',
+  })
+
+  expect((await app.request('/api/users/me', { headers: { Authorization: `Bearer ${token}` } })).status).toBe(401)
 })
 
 test('rejects a token whose audience or role is not "authenticated"', async () => {

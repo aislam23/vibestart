@@ -34,20 +34,36 @@ describe('normalizePgConnectionString', () => {
 })
 
 describe('acquireUserRoleMutationLock', () => {
-  test('takes a single named advisory lock scoped to role mutations', async () => {
+  test('bounds the wait with a transaction-scoped lock_timeout, then takes the advisory lock', async () => {
     const calls: unknown[] = []
     const tx = {
-      $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        calls.push([strings.join('?'), values])
+      $executeRawUnsafe: async (query: string) => {
+        calls.push(['unsafe', query])
         return 0
       },
-    } as unknown as Pick<DbClient, '$executeRaw'>
+      $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        calls.push(['tagged', strings.join('?'), values])
+        return 0
+      },
+    } as unknown as Pick<DbClient, '$executeRaw' | '$executeRawUnsafe'>
 
     await acquireUserRoleMutationLock(tx)
 
     expect(calls).toEqual([
-      ['SELECT pg_advisory_xact_lock(hashtext(?))', ['users:role-mutation']],
+      ['unsafe', "SET LOCAL lock_timeout = '5s'"],
+      ['tagged', 'SELECT pg_advisory_xact_lock(hashtext(?))', ['users:role-mutation']],
     ])
+  })
+
+  test('rejects a lock timeout that is not a plain Postgres interval literal', async () => {
+    const tx = {
+      $executeRawUnsafe: async () => 0,
+      $executeRaw: async () => 0,
+    } as unknown as Pick<DbClient, '$executeRaw' | '$executeRawUnsafe'>
+
+    await expect(
+      acquireUserRoleMutationLock(tx, { lockTimeout: "5s'; DROP TABLE profiles; --" }),
+    ).rejects.toThrow('Invalid lock timeout')
   })
 })
 
@@ -105,5 +121,69 @@ describe('runWithJobLock failure classification', () => {
     }).catch((error: unknown) => error)
 
     expect(isJobLockExpiry(failure)).toBe(true)
+  })
+})
+
+describe('runWithJobLock signal', () => {
+  test('passes an AbortSignal through to the job', async () => {
+    let observedSignal: AbortSignal | undefined
+    const prisma = {
+      $transaction: (run: (tx: unknown) => Promise<unknown>) =>
+        run({ $queryRaw: async () => [{ acquired: true }] }),
+    } as unknown as Pick<DbClient, '$transaction'>
+
+    await runWithJobLock(prisma, 'job', async (signal) => {
+      observedSignal = signal
+      return 'ran'
+    })
+
+    expect(observedSignal).toBeInstanceOf(AbortSignal)
+    expect(observedSignal?.aborted).toBe(false)
+  })
+
+  test('aborts the job signal when the lock expires mid-run', async () => {
+    let observedSignal: AbortSignal | undefined
+    const prisma = {
+      $transaction: async (run: (tx: unknown) => Promise<unknown>) => {
+        await run({ $queryRaw: async () => [{ acquired: true }] })
+        await Bun.sleep(30)
+        throw Object.assign(new Error('transaction expired'), { code: 'P2028' })
+      },
+    } as unknown as Pick<DbClient, '$transaction'>
+
+    const failure = await runWithJobLock(
+      prisma,
+      'job',
+      async (signal) => {
+        observedSignal = signal
+        return 'ran'
+      },
+      { timeoutMs: 10 },
+    ).catch((error: unknown) => error)
+
+    expect(isJobLockExpiry(failure)).toBe(true)
+    expect(observedSignal?.aborted).toBe(true)
+  })
+
+  test('forwards an external abort signal into the job', async () => {
+    const prisma = {
+      $transaction: (run: (tx: unknown) => Promise<unknown>) =>
+        run({ $queryRaw: async () => [{ acquired: true }] }),
+    } as unknown as Pick<DbClient, '$transaction'>
+    const controller = new AbortController()
+    let observedSignal: AbortSignal | undefined
+
+    controller.abort(new Error('shutting down'))
+    await runWithJobLock(
+      prisma,
+      'job',
+      async (signal) => {
+        observedSignal = signal
+        return 'ran'
+      },
+      { signal: controller.signal },
+    )
+
+    expect(observedSignal?.aborted).toBe(true)
   })
 })

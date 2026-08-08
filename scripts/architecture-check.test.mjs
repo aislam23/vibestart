@@ -102,6 +102,51 @@ describe('dependency direction', () => {
   })
 })
 
+describe('regex bypasses closed by this check', () => {
+  test('catches an import packed onto the same line as another statement', () => {
+    // `import` declarations are valid JS/TS syntax anywhere in a module's statement sequence
+    // (they are hoisted) - including right after a `;` on the same physical line, which line-start
+    // anchoring alone missed.
+    const violations = check([
+      file(
+        'backend/src/modules/users/application/service.ts',
+        "const noop = 1; import { Prisma } from '../../../generated/prisma/client'",
+      ),
+    ])
+    expect(violations.map((item) => item.rule)).toEqual(['backend-application-dependencies'])
+  })
+
+  test('sees through a comment between a dynamic import and its specifier', () => {
+    const violations = check([
+      file('backend/src/modules/users/transport/routes.ts', "const db = import(/* lazy */ 'pg')"),
+    ])
+    expect(violations.map((item) => item.rule)).toEqual(['backend-transport-dependencies'])
+  })
+
+  test('flags a template-literal dynamic import specifier as unresolvable instead of ignoring it', () => {
+    const violations = check([
+      file('backend/src/modules/users/transport/routes.ts', 'const mod = import(`pg`)'),
+    ])
+    expect(violations.map((item) => item.rule)).toEqual(['dynamic-import-unresolvable'])
+  })
+
+  test('forbids pg from the application and domain layers, alongside prisma', () => {
+    const violations = check([
+      file('backend/src/modules/users/application/service.ts', "import { Client } from 'pg'"),
+    ])
+    expect(violations.map((item) => item.rule)).toEqual(['backend-application-dependencies'])
+  })
+
+  test('matches a hyphenated package-family prefix like expo- against its members', () => {
+    // `expo-router`, `expo-constants`, etc. share the literal `expo-` prefix directly (no `/`
+    // separator), unlike a scoped package such as `@prisma/something`.
+    const violations = check([
+      file('packages/contracts/src/auth.ts', "import { useRouter } from 'expo-router'"),
+    ])
+    expect(violations.map((item) => item.rule)).toEqual(['contracts-dependency-direction'])
+  })
+})
+
 function check(files) {
   return checkArchitectureSources(files)
 }

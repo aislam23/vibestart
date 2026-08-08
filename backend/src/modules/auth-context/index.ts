@@ -11,6 +11,7 @@ import { ensureProfile } from './profile-repository'
 type CreateAuthContextOptions = {
   db: DbClient
   supabaseJwtSecret: string
+  supabaseJwtIssuer: string
 }
 
 /**
@@ -19,9 +20,9 @@ type CreateAuthContextOptions = {
  * made through the (future) admin module takes effect on the very next request instead of waiting
  * for a token to expire.
  */
-export function createAuthContext({ db, supabaseJwtSecret }: CreateAuthContextOptions) {
+export function createAuthContext({ db, supabaseJwtSecret, supabaseJwtIssuer }: CreateAuthContextOptions) {
   const requireAuth = createRequireAuth(async (accessToken) => {
-    const supabasePrincipal = await verifySupabaseAccessToken(accessToken, supabaseJwtSecret)
+    const supabasePrincipal = await verifySupabaseAccessToken(accessToken, supabaseJwtSecret, supabaseJwtIssuer)
     const profile = await ensureProfile(db, supabasePrincipal.userId, supabasePrincipal.displayName)
 
     return {

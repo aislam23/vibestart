@@ -1,8 +1,8 @@
 import { Cron } from 'croner'
 
-import { defaultJobLockTimeoutMs, isJobLockExpiry, runWithJobLock } from './db'
+import { isJobLockExpiry } from './db'
 import { createBackendRuntime, type BackendRuntime } from './runtime'
-import { runBackgroundJob, type BackgroundJobName } from './jobs'
+import { runBackgroundJob, type BackgroundJobName, type JobRunOutcome } from './jobs'
 
 export type ScheduleEntry = {
   /** Standard cron expression; croner also accepts a leading seconds field. */
@@ -11,8 +11,9 @@ export type ScheduleEntry = {
   /** IANA zone. Defaults to UTC so a server's local time cannot shift production schedules. */
   timeZone?: string
   /**
-   * How long the job may hold its database lock. Exceeding it releases the lock mid-run and
-   * allows a duplicate on another instance, so leave headroom over the slowest expected run.
+   * Overrides the job's own `timeoutMs` (`jobs.ts`) for how long a run from this schedule entry
+   * may hold its lock. Exceeding it releases the lock mid-run and allows a duplicate on another
+   * instance, so leave headroom over the slowest expected run. Ignored for a `parallel` job.
    */
   timeoutMs?: number
 }
@@ -37,16 +38,32 @@ export type SchedulerHandle = {
 }
 
 /** What `runScheduledJob` actually needs to run a job - `runBackgroundJob`'s signature. */
-type RunJob = (jobName: string, runtime: BackendRuntime, now?: Date) => Promise<void>
+type RunJob = (
+  jobName: string,
+  runtime: BackendRuntime,
+  now?: Date,
+  options?: { signal?: AbortSignal; timeoutMs?: number },
+) => Promise<JobRunOutcome>
+
+/** `SHUTDOWN_GRACE_SECONDS`'s own default (env.ts) - used only when a caller does not pass
+ * `shutdownGraceMs` explicitly, which `main()` below always does. */
+const defaultShutdownGraceMs = 20_000
 
 export function startSchedules(
   runtime: BackendRuntime,
   entries: ScheduleEntry[] = schedules,
-  { runJob = runBackgroundJob }: { runJob?: RunJob } = {},
+  {
+    runJob = runBackgroundJob,
+    shutdownGraceMs = defaultShutdownGraceMs,
+  }: { runJob?: RunJob; shutdownGraceMs?: number } = {},
 ): SchedulerHandle {
   // Per-instance rather than module scope, so two schedulers - in a test, or around a reload -
   // cannot end up draining each other's runs.
   const activeRuns = new Set<Promise<void>>()
+  // Aborts every in-flight job's signal on `stop()` - see `jobs.ts`'s doc comment on `signal`. This
+  // asks a job to wind down; `stop()` still only waits up to `shutdownGraceMs` for it to actually
+  // finish (see below).
+  const shutdownController = new AbortController()
 
   const jobs = entries.map((entry) => ({
     entry,
@@ -56,10 +73,11 @@ export function startSchedules(
     cron: new Cron(
       entry.expression,
       // `protect` stops a run from overlapping itself in this process; the database lock inside
-      // `runScheduledJob` stops a second process from doing the same work at the same time.
+      // `runBackgroundJob` (jobs.ts) stops a second process from doing the same work at the same
+      // time.
       { protect: true, timezone: entry.timeZone ?? 'UTC' },
       () => {
-        const run = runScheduledJob(runtime, entry, { runJob })
+        const run = runScheduledJob(runtime, entry, { runJob, signal: shutdownController.signal })
         activeRuns.add(run)
         return run.finally(() => activeRuns.delete(run))
       },
@@ -70,9 +88,29 @@ export function startSchedules(
     jobs,
     stop: async () => {
       // Timers first so nothing new starts, then let running jobs land. Cutting a job off here
-      // would leave it half-done with no success or failure recorded anywhere.
+      // would leave it half-done with no success or failure recorded anywhere; aborting the
+      // signal only asks it to wind down, it does not forcibly stop it - so the wait below is
+      // itself bounded by `shutdownGraceMs`, or a job that ignores its signal would hang shutdown
+      // forever.
       for (const { cron } of jobs) cron.stop()
-      await Promise.all([...activeRuns])
+      shutdownController.abort(new Error('scheduler is shutting down'))
+
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      const timedOut = new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), shutdownGraceMs)
+      })
+      const finishedInTime = await Promise.race([
+        Promise.all([...activeRuns]).then(() => true as const),
+        timedOut,
+      ])
+      if (timeout) clearTimeout(timeout)
+
+      if (!finishedInTime) {
+        console.error(
+          `Scheduler shutdown grace period (${shutdownGraceMs}ms) elapsed with ${activeRuns.size} ` +
+            'job(s) still running; proceeding with shutdown anyway.',
+        )
+      }
     },
   }
 }
@@ -80,15 +118,10 @@ export function startSchedules(
 export async function runScheduledJob(
   runtime: BackendRuntime,
   entry: ScheduleEntry,
-  { runJob = runBackgroundJob }: { runJob?: RunJob } = {},
+  { runJob = runBackgroundJob, signal }: { runJob?: RunJob; signal?: AbortSignal } = {},
 ) {
   try {
-    const outcome = await runWithJobLock(
-      runtime.prisma,
-      entry.job,
-      () => runJob(entry.job, runtime),
-      { timeoutMs: entry.timeoutMs ?? defaultJobLockTimeoutMs },
-    )
+    const outcome = await runJob(entry.job, runtime, undefined, { signal, timeoutMs: entry.timeoutMs })
 
     if (!outcome.ranHere) {
       console.log(`Scheduler skipped ${entry.job}: its lock is held elsewhere.`)
@@ -110,7 +143,9 @@ export async function runScheduledJob(
 
 export async function main() {
   const runtime = createBackendRuntime()
-  const { jobs, stop: stopSchedules } = startSchedules(runtime)
+  const { jobs, stop: stopSchedules } = startSchedules(runtime, schedules, {
+    shutdownGraceMs: runtime.env.SHUTDOWN_GRACE_SECONDS * 1000,
+  })
 
   if (jobs.length === 0) {
     // Nothing to wait for, so do not linger as a process that a supervisor will restart forever.

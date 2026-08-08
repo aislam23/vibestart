@@ -10,6 +10,7 @@ export class AppError extends Error {
     public readonly code: ApiErrorCode,
     message: string,
     public readonly details?: unknown,
+    public readonly headers?: Record<string, string>,
   ) {
     super(message)
   }
@@ -47,6 +48,11 @@ export function validationErrorHook(result: ValidationHookResult, c: Context) {
 
 export function handleError(error: Error, c: Context) {
   if (error instanceof AppError) {
+    if (error.headers) {
+      for (const [name, value] of Object.entries(error.headers)) {
+        c.header(name, value)
+      }
+    }
     return c.json(errorResponse(error.code, error.message, error.details), error.status)
   }
 
