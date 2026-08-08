@@ -106,6 +106,30 @@ backup-up: ## Start the scheduled backup crond service
 backup-down: ## Stop the scheduled backup crond service
 	$(BACKUP_COMPOSE) down
 
+# Volume names are fixed by infra/supabase's compose project name
+# (`name: supabase`), not by however this Makefile is invoked - confirmed
+# via `docker compose config` in infra/supabase (resolves to
+# supabase_db-data / supabase_db-config regardless of cwd).
+PRE_RESTORE_DIR := $(ROOT_DIR)/backups
+
+.PHONY: pre-restore-snapshot
+pre-restore-snapshot: ## Host-side safety net before a restore: tar db-data+db-config to backups/pre-restore-<ts>.tar.gz
+	@mkdir -p "$(PRE_RESTORE_DIR)"
+	@ts=$$(date +%Y%m%d-%H%M%S); \
+	echo "pre-restore-snapshot: this is a best-effort raw volume copy taken while supabase-db"; \
+	echo "pre-restore-snapshot: keeps running (consistent with restore.sh's own runbook, which"; \
+	echo "pre-restore-snapshot: needs db up to reconnect). For a guaranteed-consistent copy, stop"; \
+	echo "pre-restore-snapshot: it first: docker compose -f infra/supabase/docker-compose.yml stop db"; \
+	docker run --rm \
+	  -v supabase_db-data:/src/db-data:ro \
+	  -v supabase_db-config:/src/db-config:ro \
+	  -v "$(PRE_RESTORE_DIR):/dest" \
+	  alpine:3.22 \
+	  tar czf "/dest/pre-restore-$$ts.tar.gz" -C /src db-data db-config; \
+	echo "pre-restore-snapshot: wrote $(PRE_RESTORE_DIR)/pre-restore-$$ts.tar.gz"; \
+	echo "pre-restore-snapshot: rollback command (stop supabase-db first: docker compose -f infra/supabase/docker-compose.yml stop db):"; \
+	echo "  docker run --rm -v supabase_db-data:/dest/db-data -v supabase_db-config:/dest/db-config -v $(PRE_RESTORE_DIR):/src alpine:3.22 sh -c 'rm -rf /dest/db-data/* /dest/db-config/* && tar xzf /src/pre-restore-$$ts.tar.gz -C /dest'"
+
 .PHONY: deploy
 deploy: ## [not implemented] Deploy to the VPS - see .github (T7)
 	@echo "not implemented yet — see infra/backup (T4) / .github (T7)" >&2

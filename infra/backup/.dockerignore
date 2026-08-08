@@ -1,0 +1,6 @@
+# Never let secrets or local artifacts end up in the build context / image.
+.env
+.env.*
+!.env.example
+*.backup.*
+.env.backup.*

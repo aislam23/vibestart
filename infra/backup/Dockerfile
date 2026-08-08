@@ -3,7 +3,17 @@
 #
 # alpine:3.22 ships postgresql17-client-17.10-r0 (major matches
 # infra/supabase's supabase/postgres:17.6.1.136) and restic-0.18.0-r7 -
-# verified via `apk info postgresql17-client restic` against this tag.
+# tested against this exact tag via `apk info postgresql17-client restic`.
+# No `flock` package needed: alpine's base busybox already provides a
+# `flock` applet (verified: `flock --help` works with zero extra
+# packages installed).
+#
+# Deliberately no `=version` apk pins - alpine rotates package versions
+# out of its repos over time, and a pinned version that no longer exists
+# turns "rebuild this image in 6 months" into a hard failure instead of a
+# quiet drift. The RUN check below is the actual guard against drift: it
+# fails the build loudly (not silently at 3am) if a future alpine:3.22
+# rebuild ever pulls a different Postgres or restic major.
 FROM alpine:3.22
 
 RUN apk add --no-cache \
@@ -15,7 +25,11 @@ RUN apk add --no-cache \
     && addgroup -S backup \
     && adduser -S -G backup -h /home/backup backup \
     && mkdir -p /var/cache/restic /home/backup /work \
-    && chown -R backup:backup /var/cache/restic /home/backup /work
+    && chown -R backup:backup /var/cache/restic /home/backup /work \
+    && restic version \
+    && pg_dump --version \
+    && pg_dump --version | grep -q ' 17\.' \
+    && restic version | grep -q 'restic 0\.'
 
 COPY backup.sh /usr/local/bin/backup.sh
 COPY restore.sh /usr/local/bin/restore.sh

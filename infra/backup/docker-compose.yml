@@ -8,6 +8,15 @@
 # that same fixed name as external so it can reach `db` by service name
 # regardless of which project started it or in what order.
 #
+# Same reasoning for the `db-config` volume below: infra/supabase's
+# project name is `supabase` (`name: supabase` in that compose file), so
+# its unnamed `db-config` volume resolves to `supabase_db-config` -
+# confirmed via `docker compose config` in infra/supabase. That volume
+# holds the pgsodium root key (see infra/supabase/docker-compose.yml's
+# `db` service comment) - without it, encrypted vault data in a restored
+# database is unrecoverable, so this stack mounts it read-only and backs
+# it up alongside the pg_dump output.
+#
 # Usage:
 #   cp .env.example .env                          # fill in S3 + PG credentials
 #   docker compose up -d backup                    # scheduled crond service
@@ -32,7 +41,8 @@ services:
       - /etc/crontabs # entrypoint.sh writes the generated crontab here
     volumes:
       - restic-cache:/var/cache/restic
-      - backup-work:/work # pg_dump/pg_dumpall staging + restic restore target
+      - backup-work:/work # pg_dump/pg_dumpall staging + restic restore target + flock lock file
+      - db-config:/db-config:ro # supabase's pgsodium root key - read-only, backed up alongside the dumps
     environment:
       TZ: ${TZ:-UTC}
       BACKUP_CRON: ${BACKUP_CRON:-30 3 * * *}
@@ -48,6 +58,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}
       RESTIC_PASSWORD: ${RESTIC_PASSWORD:?RESTIC_PASSWORD is required - see .env.example}
       RESTIC_TIMEOUT: ${RESTIC_TIMEOUT:-1800}
+      PG_TIMEOUT: ${PG_TIMEOUT:-3600}
       KEEP_DAILY: ${KEEP_DAILY:-7}
       KEEP_WEEKLY: ${KEEP_WEEKLY:-4}
       KEEP_MONTHLY: ${KEEP_MONTHLY:-6}
@@ -69,3 +80,6 @@ networks:
 volumes:
   restic-cache:
   backup-work:
+  db-config:
+    external: true
+    name: supabase_db-config
