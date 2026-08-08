@@ -17,6 +17,8 @@ describe('loadEnv', () => {
 
     expect(env.PORT).toBe(3000)
     expect(env.SHUTDOWN_GRACE_SECONDS).toBe(20)
+    expect(env.ADMIN_USERS_READ_RATE_LIMIT_MAX).toBe(120)
+    expect(env.ADMIN_USERS_READ_RATE_LIMIT_WINDOW_SECONDS).toBe(60)
     expect(env.TRUST_PROXY).toBe(false)
     expect(env.CORS_ORIGINS).toEqual(['http://localhost:5173', 'http://localhost:8081'])
     expect(env.SERVICE_ROLE_KEY).toBeUndefined()

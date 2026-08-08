@@ -1,6 +1,11 @@
 import type { DbClient } from '../../db'
 import { verifySupabaseAccessToken } from './jwt'
-import { createRequireAuth, type AuthenticatedPrincipal, type AuthHttpEnv } from './middleware'
+import {
+  createRequireAdmin,
+  createRequireAuth,
+  type AuthenticatedPrincipal,
+  type AuthHttpEnv,
+} from './middleware'
 import { ensureProfile } from './profile-repository'
 
 type CreateAuthContextOptions = {
@@ -28,7 +33,7 @@ export function createAuthContext({ db, supabaseJwtSecret }: CreateAuthContextOp
     }
   })
 
-  return { requireAuth }
+  return { requireAuth, requireAdmin: createRequireAdmin() }
 }
 
 export type { AuthenticatedPrincipal, AuthHttpEnv }

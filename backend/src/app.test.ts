@@ -206,16 +206,50 @@ test('rejects an invalid PATCH payload with the shared validation error shape', 
   expect(body.error.code).toBe('VALIDATION_ERROR')
 })
 
-test('OpenAPI documents the users endpoints with bearer security', async () => {
+test('OpenAPI documents the users and admin endpoints with bearer security', async () => {
   const app = createApp({ env, prisma: createFakeDb() })
   const response = await app.request('/openapi.json')
   const document = (await response.json()) as {
     components?: { securitySchemes?: Record<string, unknown> }
-    paths: Record<string, { get?: { security?: unknown }; patch?: { security?: unknown } }>
+    paths: Record<
+      string,
+      { get?: { security?: unknown }; patch?: { security?: unknown } }
+    >
   }
 
   expect(response.status).toBe(200)
   expect(document.components?.securitySchemes).toHaveProperty('BearerAuth')
   expect(document.paths['/api/users/me']?.get?.security).toEqual([{ BearerAuth: [] }])
   expect(document.paths['/api/users/me']?.patch?.security).toEqual([{ BearerAuth: [] }])
+  expect(document.paths['/api/admin/metrics']?.get?.security).toEqual([{ BearerAuth: [] }])
+  expect(document.paths['/api/admin/users']?.get?.security).toEqual([{ BearerAuth: [] }])
+  expect(document.paths['/api/admin/users/{userId}/role']?.patch?.security).toEqual([
+    { BearerAuth: [] },
+  ])
+})
+
+test('rejects every admin route for an authenticated non-admin, and for no token at all', async () => {
+  const app = createApp({ env, prisma: createFakeDb() })
+  const userId = '0196f6f8-6600-7000-8000-000000000006'
+  const token = await signSupabaseToken(userId, 'nonadmin@example.com')
+
+  const metrics = await app.request('/api/admin/metrics', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const list = await app.request('/api/admin/users', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const roleChange = await app.request(`/api/admin/users/${userId}/role`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'admin' }),
+  })
+
+  for (const response of [metrics, list, roleChange]) {
+    expect(response.status).toBe(403)
+    expect((await response.json()).error.code).toBe('FORBIDDEN')
+  }
+
+  const unauthenticated = await app.request('/api/admin/metrics')
+  expect(unauthenticated.status).toBe(401)
 })

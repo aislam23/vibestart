@@ -1,0 +1,33 @@
+# Throwaway Postgres for backend integration tests - completely separate from the dev Supabase
+# stack in infra/supabase (port 54322). `scripts/test-integration.mjs` is the only thing that
+# starts or stops this compose project, and it is the one place in the repository that tears down
+# with `-v`: db_test never holds data worth keeping.
+name: vibestart-backend-test
+
+services:
+  db_test:
+    image: supabase/postgres:17.6.1.136
+    restart: "no"
+    # Bound to loopback only, and on a different port than the dev stack's 54322, so both can run
+    # at once without colliding.
+    ports:
+      - "127.0.0.1:54329:5432"
+    environment:
+      PGPORT: 5432
+      POSTGRES_PORT: 5432
+      POSTGRES_PASSWORD: test-throwaway-password
+      POSTGRES_DB: postgres
+    volumes:
+      # Test-only fixture, not the real Supabase init scripts (infra/supabase/volumes/db) - see
+      # test-db-init/README.md for why.
+      - ./scripts/test-db-init:/docker-entrypoint-initdb.d:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      # supabase/postgres's built-in superuser is `supabase_admin`, not `postgres` (unlike the
+      # vanilla postgres image) - the dev stack's roles.sql (infra/supabase/volumes/db) creates the
+      # rest (authenticator, supabase_auth_admin, ...); db_test never needs those.
+      test: ["CMD-SHELL", "pg_isready -U supabase_admin -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

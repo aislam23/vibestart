@@ -1,8 +1,14 @@
 import {
+  adminDashboardResponseSchema,
+  adminUserParamsSchema,
+  adminUsersQuerySchema,
+  adminUsersResponseSchema,
   apiErrorSchema,
   meResponseSchema,
   updateProfileRequestSchema,
   updateProfileResponseSchema,
+  updateUserRoleRequestSchema,
+  updateUserRoleResponseSchema,
 } from '@vibestart/contracts'
 import { createRoute, OpenAPIHono } from '@hono/zod-openapi'
 import type { MiddlewareHandler } from 'hono'
@@ -10,6 +16,7 @@ import type { MiddlewareHandler } from 'hono'
 import { validationErrorHook } from '../../../http/errors'
 import type { AuthHttpEnv } from '../../auth-context'
 import type { UsersService } from '../application/users-service'
+import { executeUsers } from './errors'
 
 const errorContent = {
   'application/json': {
@@ -55,20 +62,102 @@ const updateProfileRoute = createRoute({
   },
 })
 
+const metricsRoute = createRoute({
+  method: 'get',
+  path: '/metrics',
+  security: bearerSecurity,
+  responses: {
+    200: {
+      content: { 'application/json': { schema: adminDashboardResponseSchema } },
+      description: 'Administrator dashboard metrics',
+    },
+    401: { content: errorContent, description: 'Authentication required' },
+    403: { content: errorContent, description: 'Administrator access required' },
+  },
+})
+
+const listUsersRoute = createRoute({
+  method: 'get',
+  path: '/users',
+  security: bearerSecurity,
+  request: {
+    query: adminUsersQuerySchema,
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: adminUsersResponseSchema } },
+      description: 'Paginated users directory',
+    },
+    400: { content: errorContent, description: 'Invalid query' },
+    401: { content: errorContent, description: 'Authentication required' },
+    403: { content: errorContent, description: 'Administrator access required' },
+    429: { content: errorContent, description: 'Too many requests' },
+  },
+})
+
+const updateRoleRoute = createRoute({
+  method: 'patch',
+  path: '/users/{userId}/role',
+  security: bearerSecurity,
+  request: {
+    params: adminUserParamsSchema,
+    body: {
+      content: {
+        'application/json': {
+          schema: updateUserRoleRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: updateUserRoleResponseSchema } },
+      description: 'Updated user role',
+    },
+    400: { content: errorContent, description: 'Invalid payload' },
+    401: { content: errorContent, description: 'Authentication required' },
+    403: { content: errorContent, description: 'Administrator access required' },
+    404: { content: errorContent, description: 'User not found' },
+    409: { content: errorContent, description: 'Role update conflict' },
+  },
+})
+
 type CreateUsersRoutesOptions = {
+  adminUsersReadRateLimit: MiddlewareHandler<AuthHttpEnv>
+  requireAdmin: MiddlewareHandler<AuthHttpEnv>
   requireAuth: MiddlewareHandler<AuthHttpEnv>
   service: UsersService
 }
 
-export function createUsersRoutes({ requireAuth, service }: CreateUsersRoutesOptions) {
-  const routes = new OpenAPIHono<AuthHttpEnv>({ defaultHook: validationErrorHook })
+export function createUsersRoutes({
+  adminUsersReadRateLimit,
+  requireAdmin,
+  requireAuth,
+  service,
+}: CreateUsersRoutesOptions) {
+  const userRoutes = new OpenAPIHono<AuthHttpEnv>({ defaultHook: validationErrorHook })
+  const adminRoutes = new OpenAPIHono<AuthHttpEnv>({ defaultHook: validationErrorHook })
 
-  routes.use('*', requireAuth)
-  routes.openapi(meRoute, (c) => c.json(service.me(c.var.user), 200))
-  routes.openapi(updateProfileRoute, async (c) => {
+  userRoutes.use('*', requireAuth)
+  userRoutes.openapi(meRoute, (c) => c.json(service.me(c.var.user), 200))
+  userRoutes.openapi(updateProfileRoute, async (c) => {
     const result = await service.updateProfile(c.var.user, c.req.valid('json'))
     return c.json(result, 200)
   })
 
-  return routes
+  adminRoutes.use('*', requireAuth)
+  adminRoutes.use('*', requireAdmin)
+  adminRoutes.use('/users', adminUsersReadRateLimit)
+  adminRoutes.openapi(metricsRoute, async (c) => c.json(await service.metrics(), 200))
+  adminRoutes.openapi(listUsersRoute, async (c) => {
+    return c.json(await service.listUsers(c.req.valid('query')), 200)
+  })
+  adminRoutes.openapi(updateRoleRoute, async (c) => {
+    const result = await executeUsers(() =>
+      service.updateRole(c.var.user, c.req.valid('param').userId, c.req.valid('json')),
+    )
+    return c.json(result, 200)
+  })
+
+  return { adminRoutes, userRoutes }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { isJobLockExpiry, runWithJobLock, type DbClient } from './db'
+import { acquireUserRoleMutationLock, isJobLockExpiry, runWithJobLock, type DbClient } from './db'
 import { normalizePgConnectionString } from './db'
 
 describe('normalizePgConnectionString', () => {
@@ -30,6 +30,24 @@ describe('normalizePgConnectionString', () => {
     )
 
     expect(result).toBe('postgresql://postgres:postgres@localhost:54322/postgres?schema=public')
+  })
+})
+
+describe('acquireUserRoleMutationLock', () => {
+  test('takes a single named advisory lock scoped to role mutations', async () => {
+    const calls: unknown[] = []
+    const tx = {
+      $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        calls.push([strings.join('?'), values])
+        return 0
+      },
+    } as unknown as Pick<DbClient, '$executeRaw'>
+
+    await acquireUserRoleMutationLock(tx)
+
+    expect(calls).toEqual([
+      ['SELECT pg_advisory_xact_lock(hashtext(?))', ['users:role-mutation']],
+    ])
   })
 })
 

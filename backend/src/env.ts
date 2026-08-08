@@ -41,6 +41,10 @@ const envSchema = z
           .filter(Boolean),
       ),
     SHUTDOWN_GRACE_SECONDS: z.coerce.number().int().positive().max(60).default(20),
+    // Budget for the admin users-directory read endpoint (GET /api/admin/users), keyed by
+    // administrator id in src/modules/users. Independent of any other rate limit the backend adds.
+    ADMIN_USERS_READ_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
+    ADMIN_USERS_READ_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
     TRUST_PROXY: booleanStringSchema,
     TRUSTED_PROXY_CLIENT_IP_HEADER: optionalHttpHeaderNameSchema,
     TRUSTED_PROXY_CLIENT_IP_POSITION: z.enum(['first', 'last']).optional(),

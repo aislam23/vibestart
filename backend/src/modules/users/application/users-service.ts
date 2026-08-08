@@ -1,10 +1,14 @@
-import type { UpdateProfileRequest, UserDto } from '@vibestart/contracts'
+import type { AdminUsersQuery, UpdateProfileRequest, UpdateUserRoleRequest, UserDto } from '@vibestart/contracts'
 
 import type { AuthenticatedPrincipal } from '../../auth-context'
-import type { ProfileWriter } from './ports'
+import type { AdminMetricsReader, AdminUsersReader, Clock, ProfileWriter, UserRoleUpdater } from './ports'
 
 type UsersServiceDependencies = {
+  adminMetricsReader: AdminMetricsReader
+  adminUsersReader: AdminUsersReader
+  clock: Clock
   profileWriter: ProfileWriter
+  userRoleUpdater: UserRoleUpdater
 }
 
 export class UsersService {
@@ -21,6 +25,26 @@ export class UsersService {
     )
     return {
       user: this.userDto({ ...principal, displayName: updated.displayName }),
+    }
+  }
+
+  metrics() {
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000
+    const createdAfter = new Date(this.dependencies.clock.now().getTime() - sevenDaysMs)
+    return this.dependencies.adminMetricsReader.metrics(createdAfter)
+  }
+
+  listUsers(query: AdminUsersQuery) {
+    return this.dependencies.adminUsersReader.listUsers(query)
+  }
+
+  async updateRole(principal: AuthenticatedPrincipal, targetUserId: string, input: UpdateUserRoleRequest) {
+    return {
+      user: await this.dependencies.userRoleUpdater.updateRole({
+        actorUserId: principal.id,
+        targetUserId,
+        role: input.role,
+      }),
     }
   }
 

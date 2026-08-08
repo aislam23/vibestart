@@ -33,6 +33,7 @@ new models; `profiles` is the one exception, since its id mirrors `auth.users.id
 | `PORT` | no, default `3000` | |
 | `CORS_ORIGINS` | no | Comma-separated exact browser origins (no wildcards, no paths); must be HTTPS-only when `NODE_ENV=production`. |
 | `SHUTDOWN_GRACE_SECONDS` | no, default `20` | Shared budget for draining background tasks and stopping the HTTP server. |
+| `ADMIN_USERS_READ_RATE_LIMIT_MAX` / `_WINDOW_SECONDS` | no, default `120` / `60` | Independent rate-limit budget for `GET /api/admin/users`, keyed by administrator id. |
 | `TRUST_PROXY` | no, default `false` | When `true`, requires `TRUSTED_PROXY_CLIENT_IP_HEADER`. |
 | `TRUSTED_PROXY_CLIENT_IP_HEADER` / `_POSITION` | conditional | Required together with `TRUST_PROXY=true`; `POSITION` picks `first` or `last` of a comma-separated proxy chain. |
 
@@ -55,6 +56,59 @@ Copy `backend/.env.example` to `backend/.env` for local development.
 There are no cookies and no `/api/auth/*` routes on the backend - CORS runs with
 `credentials: false`.
 
+## Admin API
+
+`src/modules/users` also owns the admin surface, gated by `requireAdmin`
+(`src/modules/auth-context/middleware.ts`), which runs after `requireAuth` and checks the
+already-fresh `c.var.user.role`:
+
+- `GET /api/admin/metrics` - `{ totalUsers, totalAdmins, newUsersLast7Days }`.
+- `GET /api/admin/users` - paginated, searches email and display name, rate-limited independently
+  (`ADMIN_USERS_READ_RATE_LIMIT_MAX`/`_WINDOW_SECONDS`) keyed by administrator id.
+- `PATCH /api/admin/users/:userId/role` - changes a user's role inside a transaction serialized by
+  a Postgres advisory lock (`acquireUserRoleMutationLock`, `src/db.ts`), so two concurrent role
+  changes can never leave zero administrators. Rejects self-demotion and demoting the last
+  administrator with `409 CONFLICT`.
+
+**No session revocation on a role change.** The source template this repository is based on
+revokes sessions after a role change, because it issues and stores its own session tokens. This
+backend never does that: Supabase issues and owns the access token, and `auth-context` re-reads
+`profiles.role` on every single request (see "How auth works" above), so a role change already
+takes effect on the *very next request* with the same token - there is nothing to revoke.
+
+`profiles` deliberately has no `email` column - Supabase owns `auth.users` and this backend never
+writes to it. The one exception is
+`src/modules/users/infrastructure/admin-users-repository.ts`, which reads `auth.users` with a
+raw, read-only SQL join for the admin directory only; nowhere else in the backend touches that
+table.
+
+## Background jobs
+
+Work that runs outside any HTTP request. One registry (`src/jobs.ts`, `backgroundJobs`), three
+processes that can run it:
+
+| Process | Shape | Use it when |
+| --- | --- | --- |
+| `src/cron.ts` | One shot: runs a single named job, then exits. | A provider timer already exists (a scheduled job, a system crontab). |
+| `src/scheduler.ts` | Long-running process, timers (`schedules`) inside. | Schedules should live in the repository; a VPS or a cloud worker component. |
+| `src/worker.ts` | Long-running loop (`workerLoops`). | Work must run more often than once a minute, or several jobs side by side. |
+
+All three ship **empty** - this template has no session table to sweep (Supabase Auth owns
+sessions) and no other recurring work yet, so an install that never needs one pays nothing for it.
+Uncomment the commented example in `jobs.ts` (and a runner) once a real job exists. `scheduler.ts`
+and `worker.ts` take a Postgres advisory lock (`runWithJobLock`, `src/db.ts`) before a locked run,
+so a rolling deploy or a scaled-out worker cannot run the same job twice; the copy that loses the
+race logs that it skipped. Run any job by hand: `bun run --cwd backend start:cron -- <job>`. See
+the doc comments in `src/jobs.ts`, `src/scheduler.ts`, and `src/worker.ts` for lock timeouts and
+the trade-offs between the three runners - the mechanism is a direct port of the source template's
+`docs/BACKGROUND_JOBS.md`, only the starter registry (empty here) differs.
+
+```bash
+bun run --cwd backend start:cron -- <job>
+bun run --cwd backend start:scheduler
+bun run --cwd backend start:worker
+```
+
 ## Dev loop
 
 ```bash
@@ -68,7 +122,8 @@ bun run --cwd backend dev
 ```
 
 Root workspace aliases: `bun run dev:backend`, `bun run build:backend`, `bun run typecheck:backend`,
-`bun run test:backend`.
+`bun run test:backend`, `bun run test:backend:integration`, `bun run smoke:backend:docker`,
+`bun run architecture:check`.
 
 ## Commands
 
@@ -85,26 +140,51 @@ bun run --cwd backend prisma:deploy
 bun run --cwd backend prisma:validate
 ```
 
-`bun run --cwd backend test` runs the full unit test suite (no database required - every module
-test uses a fake Prisma client or a `jose`-signed test JWT). There are no database-gated tests in
-this skeleton; DB reality is instead verified by actually applying `prisma/migrations` and booting
-the app against the real `infra/supabase` Postgres.
+## Testing
+
+Three layers, each cheaper and faster than the next:
+
+- **Unit** - `bun run --cwd backend test` (root alias: `bun run test:backend`). No database:
+  every module test uses a fake Prisma client or a `jose`-signed test JWT. Runs as part of the
+  root `bun run test`, alongside `bun run architecture:check` (root `scripts/architecture-check.mjs`,
+  its own test: `bun run test:architecture`), which statically checks module boundaries and layering
+  (transport must not import Prisma; application/domain must not import Hono, Prisma, env, or
+  provider SDKs; cross-module imports only through a module's `index.ts`; `packages/contracts` must
+  not import backend, client, framework, or provider code).
+- **Integration** - `bun run --cwd backend test:integration` (root alias:
+  `bun run test:backend:integration`). Starts a throwaway Postgres (`backend/docker-compose.test.yml`,
+  service `db_test`, port `127.0.0.1:54329` - **not** the dev Supabase stack in `infra/supabase`,
+  port `54322`), applies `prisma/migrations`, runs every `*.integration.test.ts` file against it,
+  then tears the container down with `docker compose down --volumes` (the one place in the
+  repository a `-v` teardown is correct: `db_test` never holds anything worth keeping). Not part of
+  the default `bun run test` chain - it needs Docker and takes longer, so CI calls it as its own
+  step. `db_test` gets a minimal stub `auth.users(id, email)` table
+  (`backend/scripts/test-db-init`) instead of running real Supabase Auth, just enough for the admin
+  directory's read-only join to work against real Postgres; see the comment in that SQL file for
+  why.
+- **Docker smoke** - `bun run --cwd backend smoke:docker` (root alias:
+  `bun run smoke:backend:docker`). Builds `backend/Dockerfile`, runs the image against `db_test`,
+  and asserts `GET /health/ready` returns `200` - the same check a container orchestrator's
+  readiness probe would make.
 
 ## Architecture
 
-`src/index.ts` starts the API server. `src/runtime.ts` loads env, creates the Prisma client, and
-owns background-task/Prisma cleanup - shared by the API today and by future worker/cron entrypoints.
-`src/app.ts` is the composition root: CORS, secure headers, health endpoints, module wiring, route
-mounting, and OpenAPI output. `src/env.ts` validates environment variables with Zod. `src/db.ts`
-creates the Prisma client and normalizes DigitalOcean-style `sslmode=require` URLs for the Prisma
-PostgreSQL adapter; `runWithJobLock` is a Postgres advisory-lock helper for the background jobs a
-follow-up task adds. `src/modules/auth-context` is the authentication/principal golden path
-described above. `src/modules/users` owns the current user's own profile (`GET /api/users/me`,
-`PATCH /api/users/me`); admin directory reads and role changes are a follow-up module. Transport
-must not import Prisma; application and domain must not import Hono, Prisma, env, or provider SDKs;
-infrastructure implements context-specific ports. Routes stay thin and translate HTTP into
-application calls and application failures into the stable API error shape from
-`@vibestart/contracts`.
+`src/index.ts` starts the API server; `src/cron.ts`, `src/scheduler.ts`, and `src/worker.ts` are
+the three background-job entrypoints (see "Background jobs" above), all built on the same
+`src/runtime.ts`, which loads env, creates the Prisma client, and owns background-task/Prisma
+cleanup. `src/app.ts` is the API composition root: CORS, secure headers, health endpoints, module
+wiring, route mounting, and OpenAPI output. `src/env.ts` validates environment variables with Zod.
+`src/db.ts` creates the Prisma client, normalizes DigitalOcean-style `sslmode=require` URLs for the
+Prisma PostgreSQL adapter, and holds two Postgres advisory-lock helpers: `runWithJobLock` for
+background jobs and `acquireUserRoleMutationLock` for admin role changes. `src/modules/auth-context`
+is the authentication/principal golden path described above, plus `requireAdmin`. `src/modules/users`
+owns both the current user's own profile (`GET`/`PATCH /api/users/me`) and the admin surface (see
+"Admin API" above) behind one `UsersService`. Transport must not import Prisma; application and
+domain must not import Hono, Prisma, env, or provider SDKs; infrastructure implements
+context-specific ports; cross-module imports go through a module's `index.ts` only.
+`scripts/architecture-check.mjs` at the repository root enforces all of this statically. Routes
+stay thin and translate HTTP into application calls and application failures into the stable API
+error shape from `@vibestart/contracts`.
 
 Prisma migration SQL is not written by hand for schema changes - change `prisma/schema.prisma`,
 then run `bun run --cwd backend prisma:migrate`. The one exception is the `uuidv7()` function

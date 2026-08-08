@@ -16,7 +16,12 @@ type CreateAppOptions = {
 
 export function createApp({ env, prisma }: CreateAppOptions) {
   const authContext = createAuthContext({ db: prisma, supabaseJwtSecret: env.SUPABASE_JWT_SECRET })
-  const users = createUsersModule({ db: prisma, requireAuth: authContext.requireAuth })
+  const users = createUsersModule({
+    db: prisma,
+    env,
+    requireAdmin: authContext.requireAdmin,
+    requireAuth: authContext.requireAuth,
+  })
 
   const app = new OpenAPIHono<AuthHttpEnv>({
     defaultHook: validationErrorHook,
@@ -64,7 +69,8 @@ export function createApp({ env, prisma }: CreateAppOptions) {
     }
   })
 
-  app.route('/api/users', users.routes)
+  app.route('/api/users', users.userRoutes)
+  app.route('/api/admin', users.adminRoutes)
 
   app.doc('/openapi.json', {
     openapi: '3.0.0',

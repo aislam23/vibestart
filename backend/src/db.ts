@@ -103,6 +103,21 @@ function isPrismaTransactionFailure(error: unknown) {
 }
 
 /**
+ * Serializes every admin role change behind one Postgres advisory lock, held for the transaction.
+ *
+ * Without it, two concurrent role changes (e.g. two admins each demoting the other, or two
+ * requests racing to demote the last remaining admin) can each read "more than one admin exists"
+ * before either write commits, and both proceed - leaving zero admins. Taking this lock first
+ * forces role changes through one at a time, so the second request in any race sees the first
+ * one's already-committed write.
+ */
+export async function acquireUserRoleMutationLock(tx: Pick<DbClient, '$executeRaw'>) {
+  // `$executeRaw`, not `$queryRaw`: `pg_advisory_xact_lock` returns `void`, a column type the
+  // driver adapter cannot deserialize into a result row.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'users:role-mutation'}))`
+}
+
+/**
  * Normalizes managed-Postgres connection strings that use `sslmode=require` (e.g. DigitalOcean
  * Managed PostgreSQL) so the Prisma PostgreSQL adapter uses libpq-compatible TLS handling.
  */

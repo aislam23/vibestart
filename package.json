@@ -22,12 +22,16 @@
     "dev": "bun run --filter '*' --parallel dev",
     "build": "bun run --filter '*' --sequential build",
     "typecheck": "bun run --filter '*' --sequential typecheck",
-    "test": "bun run test:contracts && bun run test:backend",
+    "test": "bun run test:contracts && bun run test:backend && bun run test:architecture && bun run architecture:check",
     "test:contracts": "bun run --cwd packages/contracts test",
     "dev:backend": "bun run --cwd backend dev",
     "build:backend": "bun run --cwd backend build",
     "typecheck:backend": "bun run --cwd backend typecheck",
     "test:backend": "bun run --cwd backend test",
+    "test:backend:integration": "bun run --cwd backend test:integration",
+    "smoke:backend:docker": "bun run --cwd backend smoke:docker",
+    "test:architecture": "bun test scripts/architecture-check.test.mjs",
+    "architecture:check": "bun run scripts/architecture-check.mjs",
     "secrets:generate": "bun infra/supabase/generate-secrets.ts"
   }
 }
