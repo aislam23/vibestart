@@ -13,7 +13,11 @@
 # intentionally does NOT import this snippet - see that host block for why.
 (security_headers) {
 	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# includeSubDomains omitted deliberately: it applies to every
+		# subdomain of this host, including future ones that may not yet
+		# serve HTTPS. Add it back only after confirming every subdomain
+		# (present and planned) is HTTPS-only.
+		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "strict-origin-when-cross-origin"
@@ -41,13 +45,19 @@
 				request>uri query {
 					delete apikey
 					delete token
+					delete token_hash
 					delete access_token
 					delete refresh_token
 					delete code
+					delete confirmation_url
 					delete X-Amz-Signature
 					delete X-Amz-Credential
 					delete X-Amz-Security-Token
 				}
+				# Referer can carry the same sensitive query params (apikey,
+				# token, etc.) via whatever page linked here - drop the
+				# whole header rather than trying to redact its query string.
+				request>headers>Referer delete
 			}
 		}
 	}
@@ -60,16 +70,41 @@
 	import access_log
 
 	# Bind-mounted read-only from ../../webapp/dist (see docker-compose.yml).
-	# Doesn't exist until T6 builds it; Docker creates an empty dir and
-	# Caddy serves 404s until then, which is fine pre-launch.
 	root * /srv/webapp
-	file_server
 
-	@hashed path_regexp hashed \.[0-9a-f]{8,}\.(js|css|woff2?|svg|png|jpe?g|webp|ico)$
-	header @hashed Cache-Control "public, max-age=31536000, immutable"
-	header /index.html Cache-Control "no-cache"
+	# `route` preserves this literal write order instead of Caddy's normal
+	# automatic directive sorting, which always runs `header` before
+	# `rewrite`/`file_server` regardless of where it's written in the
+	# Caddyfile. That auto-sorting was the original bug here: a no-cache
+	# header pinned to the literal path /index.html only ever matched a
+	# direct request for that path, never a client route like /dashboard
+	# that needs to be rewritten to it first.
+	route {
+		# (a) hashed, content-addressed filenames are safe to cache forever.
+		@hashed path_regexp hashed \.[0-9a-f]{8,}\.(js|css|map|woff2?|svg|png|jpe?g|webp|ico)$
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
 
-	try_files {path} /index.html
+		# (b) a request that looks like a build asset (by extension) but
+		# doesn't exist on disk is a real 404 - never an index.html
+		# fallback. A missing asset from a broken deploy must fail loudly,
+		# not silently serve the SPA shell with a 200.
+		@missing_asset {
+			path_regexp asset_ext \.(js|css|map|ico|png|svg|jpe?g|webp|woff2?)$
+			not file
+		}
+		respond @missing_asset 404
+
+		# (c) anything else that isn't a real file on disk is a client-side
+		# route - rewrite to the SPA shell. `header` runs after this
+		# rewrite (route order, not Caddy's auto-sort), so no-cache
+		# correctly applies to every rewritten route, not just a literal
+		# request to /index.html.
+		@notStatic not file
+		rewrite @notStatic /index.html
+		header /index.html Cache-Control "no-cache"
+
+		file_server
+	}
 }
 
 # --- website: Astro static build (T7) -------------------------------------
@@ -109,10 +144,13 @@
 	# No security_headers import here: X-Frame-Options DENY would break
 	# Studio's SQL editor / table editor, which render some panels (e.g.
 	# the AI assistant, embedded docs) in iframes. HSTS/nosniff/Referrer-
-	# Policy are still applied explicitly below - only framing is left open.
+	# Policy are still applied explicitly below, and framing is restricted
+	# to same-origin (SAMEORIGIN) rather than left fully open - only a
+	# third-party site framing Studio for clickjacking is blocked.
 	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		-Server
 	}

@@ -1,7 +1,8 @@
 # Caddy reverse-proxy stack for vibestart - the only stack with ports
-# published to the internet. Owns the shared `edge` Docker network that
-# infra/supabase's kong service (and, from T5, backend) attach to as
-# external. See README.md for the topology and first-run runbook.
+# published to the internet. Attaches to the shared `edge` Docker network
+# as external - the network itself is provisioned independently (`make
+# ensure-network` / `docker network create edge`), not owned by this stack.
+# See README.md for the topology and first-run runbook.
 #
 # Usage:
 #   cp .env.example .env   # fill in real domains + ACME email
@@ -14,25 +15,45 @@ services:
     container_name: edge-caddy
     image: caddy:2.11.4
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp" # HTTP/3 (QUIC)
     environment:
-      ACME_EMAIL: ${ACME_EMAIL}
-      APP_DOMAIN: ${APP_DOMAIN}
-      SITE_DOMAIN: ${SITE_DOMAIN}
-      API_DOMAIN: ${API_DOMAIN}
-      SUPABASE_DOMAIN: ${SUPABASE_DOMAIN}
+      # `:?...` enforces these at `docker compose config`/`up` time - fail
+      # fast with a clear message instead of Caddy starting with blank
+      # domains and silently misrouting.
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required}
+      SITE_DOMAIN: ${SITE_DOMAIN:?SITE_DOMAIN is required}
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN is required}
+      SUPABASE_DOMAIN: ${SUPABASE_DOMAIN:?SUPABASE_DOMAIN is required}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Static builds, read-only - Caddy only ever serves these, never
       # writes them. Bind mounts (not named volumes) so `webapp`/`website`
-      # builds land here directly from the repo checkout on the VPS. They
-      # may not exist yet (T6/T7 not built) - Docker creates empty dirs on
-      # first `up`, and Caddy just 404s until a build is deployed there.
-      - ../../webapp/dist:/srv/webapp:ro
-      - ../../website/dist:/srv/website:ro
+      # builds land here directly from the repo checkout on the VPS.
+      # `create_host_path: false` means these directories must already
+      # exist (created by the deploy checklist / `make edge-up`'s mkdir) -
+      # Compose refuses to silently create them, so a missing build output
+      # fails loudly instead of masking a broken deploy as an empty mount.
+      - type: bind
+        source: ../../webapp/dist
+        target: /srv/webapp
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../website/dist
+        target: /srv/website
+        read_only: true
+        bind:
+          create_host_path: false
       # ACME account/cert material and Caddy's runtime config/OCSP state.
       - caddy-data:/data
       - caddy-config:/config
@@ -45,13 +66,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       - edge
 
 networks:
-  # Owned here (fixed name, not project-prefixed) so other compose projects
-  # (infra/supabase's kong, and backend from T5) can join it as external.
+  # Provisioned independently of any single stack (`make ensure-network` /
+  # `docker network create edge`) so infra/supabase's kong service, this
+  # stack, and (from T5) backend can all attach to it as external in any
+  # start/stop order - no stack owns or creates it anymore.
   edge:
+    external: true
     name: edge
 
 volumes:

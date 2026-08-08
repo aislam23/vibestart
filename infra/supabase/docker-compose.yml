@@ -383,8 +383,8 @@ services:
     entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
     networks:
       - supabase
-    # Once T3 adds the Caddy edge-proxy stack, attach kong here too so Caddy
-    # can reach it by service name:
+    # Once T3's edge stack is wired up, attach kong here too so Caddy can
+    # reach it by service name:
     #   networks:
     #     - supabase
     #     - edge
@@ -392,12 +392,12 @@ services:
 networks:
   supabase:
     name: supabase
-  # T3 (Caddy edge-proxy) creates this network externally and attaches to
-  # it, plus attaches kong to it (see the commented `networks:` block on
-  # that service above). Only kong ever joins `edge` - Studio is reached
-  # exclusively through Kong, never directly. Declared here only as
-  # documentation - it is NOT active, so `docker compose up` never requires
-  # it to exist.
+  # The `edge` network is provisioned independently of any single stack
+  # (`make ensure-network` / `docker network create edge`), not created by
+  # T3's Caddy edge-proxy stack - see infra/edge/README.md. Only kong ever
+  # joins it here - Studio is reached exclusively through Kong, never
+  # directly. Declared here only as documentation - it is NOT active, so
+  # `docker compose up` never requires it to exist.
   # edge:
   #   external: true
   #   name: edge

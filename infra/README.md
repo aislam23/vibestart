@@ -20,12 +20,15 @@ are static builds Caddy serves directly from bind mounts.
 
 ## Network topology
 
-`infra/edge` owns a Docker network named `edge` (fixed name, not
-project-prefixed, so other compose projects can attach to it as
-`external: true`). It is the **only** network any of this reaches the
-internet through - every other service either binds to `127.0.0.1` or
-stays on its stack's private compose network and is reached from Caddy by
-joining `edge`.
+The `edge` Docker network (fixed name, not project-prefixed) is
+provisioned independently of any single stack - `make ensure-network` (run
+automatically by `make up`/`edge-up`/`supabase-up`), or `docker network
+create edge` directly. Every compose project that needs it (`infra/edge`,
+`infra/supabase`'s `kong` service, and from T5 `backend`) attaches as
+`external: true`, so any stack can be started or stopped in any order. It
+is the **only** network any of this reaches the internet through - every
+other service either binds to `127.0.0.1` or stays on its stack's private
+compose network and is reached from Caddy by joining `edge`.
 
 ```
                               Internet
@@ -76,18 +79,47 @@ OS and provider.
 2. **DNS**: A (and AAAA, if the VPS has IPv6) records for every domain in
    `infra/edge/.env` (`APP_DOMAIN`, `SITE_DOMAIN`, `API_DOMAIN`,
    `SUPABASE_DOMAIN`) pointing at the VPS's public IP, set up *before*
-   bringing the edge stack up (Caddy requests ACME certs on first
-   request per host).
+   bringing the edge stack up - Caddy requests ACME certs for every host
+   as soon as it loads its config, and a host with unresolved DNS just
+   stays uncertified until DNS catches up (see `infra/edge/README.md`,
+   "How TLS/ACME works").
 3. **Firewall**: only 22 (SSH), 80, and 443 open to the internet - every
    other port (Postgres 54322, Kong's `KONG_HTTP_PORT` 54321, Caddy's
    admin API on 2019) stays bound to `127.0.0.1` or container-internal and
    must never be opened externally. Use whatever the VPS provider or OS
    ships (`ufw`, `nftables`, a cloud security-group) - not prescribed here.
-4. **Secrets**: `make secrets` (writes `infra/supabase/.env`); copy
+   Note that Docker-published ports (any service's `ports:` entry) insert
+   their own rules ahead of most firewall chains and bypass `ufw`/`nftables`
+   filtering by default - enforce at the provider firewall (cloud
+   security-group) and/or Docker's `DOCKER-USER` iptables chain, not `ufw`
+   alone. The current stacks bind every internal service to `127.0.0.1`,
+   so nothing is exposed by default; treat adding a `ports:` entry to any
+   future service as a firewall decision, not just a compose edit.
+4. **Secrets**: `make secrets-prod` (writes `infra/supabase/.env`; pass
+   `ARGS="--site-url=... --api-external-url=... --public-url=..."` for the
+   production URLs - see the root `Makefile`); copy
    `infra/edge/.env.example` to `infra/edge/.env` and fill in real domains.
-5. **First run**: `make edge-up` once (creates the `edge` network), then
-   uncomment `infra/supabase`'s `kong` network block per
-   `infra/edge/README.md`, then `make up` for every run after that.
+5. **Static build directories**: create `webapp/dist` and `website/dist`
+   on the VPS (owned by the deploy user) before bringing the edge stack up
+   - they're bind-mounted read-only with `create_host_path: false`, so
+   Compose refuses to create them for you.
+6. **Docker log limits**: set log rotation daemon-wide in
+   `/etc/docker/daemon.json` so the Supabase stack's many services don't
+   fill the disk with unbounded logs (the edge stack's `caddy` service
+   already sets its own limits in `docker-compose.yml`):
+   ```json
+   {
+     "log-driver": "json-file",
+     "log-opts": { "max-size": "10m", "max-file": "5" }
+   }
+   ```
+   then `systemctl restart docker` to apply it.
+7. **First run**: `make up` from the repo root (this runs
+   `make ensure-network` first, creating the `edge` network if it doesn't
+   already exist), then uncomment `infra/supabase`'s `kong` network block
+   per `infra/edge/README.md`. The `edge` network is provisioned
+   independently of either stack, so `infra/edge` and `infra/supabase` can
+   be started or stopped in any order after that.
 
 ## Staging
 
