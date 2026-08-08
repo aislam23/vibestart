@@ -24,6 +24,7 @@ bun-debug.log*
 !backend/.env*.example
 !webapp/.env*.example
 !website/.env*.example
+!**/.env.example
 infra/**/.env
 
 # Prisma generated client
@@ -36,3 +37,17 @@ backend/.prisma-generate.lock
 .vscode/
 *.swp
 *.swo
+
+# Secrets and credentials
+*.pem
+*.key
+*.p12
+
+# Backups and dumps
+*.dump
+*.sql.gz
+backups/
+
+# Terraform
+.terraform/
+*.tfstate*

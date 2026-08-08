@@ -1,10 +1,10 @@
 import { z } from 'zod'
 
-import { emailSchema, userRoleSchema, userSchema } from './auth'
+import { displayNameDtoSchema, displayNameValueSchema, emailSchema, userIdSchema, userRoleSchema, userSchema } from './auth'
 
 export const updateProfileRequestSchema = z
   .object({
-    displayName: z.union([z.string().trim().min(2).max(80), z.null()]),
+    displayName: z.union([displayNameValueSchema, z.null()]),
   })
   .strict()
 
@@ -14,8 +14,15 @@ export const updateProfileResponseSchema = z
   })
   .strict()
 
+const CANONICAL_INTEGER_STRING_PATTERN = /^(0|[1-9]\d*)$/
+
 const positiveIntegerQuerySchema = (defaultValue: number, maximum?: number) =>
-  z.coerce.number().int().positive().max(maximum ?? Number.MAX_SAFE_INTEGER).default(defaultValue)
+  z.preprocess((value) => {
+    if (typeof value === 'string' && CANONICAL_INTEGER_STRING_PATTERN.test(value)) {
+      return Number(value)
+    }
+    return value
+  }, z.number().int().positive().max(maximum ?? Number.MAX_SAFE_INTEGER)).default(defaultValue)
 
 export const ADMIN_USERS_MAX_PAGE = 100
 
@@ -32,15 +39,15 @@ export const adminUsersQuerySchema = z
 
 export const adminUserParamsSchema = z
   .object({
-    userId: z.uuid(),
+    userId: userIdSchema,
   })
   .strict()
 
 export const adminUserSummarySchema = z
   .object({
-    id: z.string(),
+    id: userIdSchema,
     email: emailSchema,
-    displayName: z.string().nullable(),
+    displayName: displayNameDtoSchema,
     role: userRoleSchema,
     createdAt: z.string().datetime(),
   })

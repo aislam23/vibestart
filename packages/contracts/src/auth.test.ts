@@ -1,3 +1,4 @@
+// Modified from the Vibe Coding Template (https://github.com/di-sukharev/vibe), Apache-2.0. See NOTICE.
 import { describe, expect, test } from 'bun:test'
 
 import type { UserDto } from './index'
@@ -8,10 +9,11 @@ import {
   passwordResetRequestResponseSchema,
   passwordResetRequestSchema,
   registerRequestSchema,
+  userSchema,
 } from './index'
 
 const validUser = {
-  id: 'user_1',
+  id: '019c0000-0000-7000-8000-000000000001',
   email: 'user@example.com',
   displayName: null,
   role: 'user',
@@ -65,9 +67,54 @@ describe('auth contracts', () => {
     ).toThrow()
 
     expect(() =>
+      registerRequestSchema.parse({
+        email: 'user@example.com',
+        password: 'password123',
+        displayName: '   ',
+      }),
+    ).toThrow()
+
+    expect(() =>
+      registerRequestSchema.parse({
+        email: 'user@example.com',
+        password: 'password123',
+        displayName: 'Jane',
+        role: 'admin',
+      }),
+    ).toThrow()
+  })
+
+  test('decouples login password validation from the registration password policy', () => {
+    expect(
       loginRequestSchema.parse({
         email: 'user@example.com',
         password: 'short',
+      }),
+    ).toEqual({
+      email: 'user@example.com',
+      password: 'short',
+    })
+
+    expect(() =>
+      loginRequestSchema.parse({
+        email: 'user@example.com',
+        password: '',
+      }),
+    ).toThrow()
+
+    expect(() =>
+      loginRequestSchema.parse({
+        email: 'user@example.com',
+        password: 'a'.repeat(257),
+      }),
+    ).toThrow()
+  })
+
+  test('rejects user DTOs with unexpected fields', () => {
+    expect(() =>
+      userSchema.parse({
+        ...validUser,
+        passwordHash: 'must-not-leak',
       }),
     ).toThrow()
   })
@@ -108,6 +155,16 @@ describe('auth contracts', () => {
         error: {
           code: 'SOMETHING_ELSE',
           message: 'Nope',
+        },
+      }),
+    ).toThrow()
+
+    expect(() =>
+      apiErrorSchema.parse({
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Something went wrong',
+          details: [{ path: ['email'], message: 'Invalid email address' }],
         },
       }),
     ).toThrow()

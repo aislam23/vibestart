@@ -30,8 +30,7 @@ When a schema changes, validate both sides in the same pass:
 
 - backend route/service validation and serialization;
 - web API client, form parsing, and UI state;
-- mobile API client, form parsing, and UI state;
-- relevant unit/integration/E2E tests from [../../docs/TESTING.md](../../docs/TESTING.md).
+- relevant unit, integration, and E2E tests.
 
 Do not add runtime-only business logic here. Contracts should stay focused on data validation, normalization, and shared TypeScript types.
 

@@ -10,3 +10,17 @@ coverage
 .env.*
 webapp/e2e/.artifacts
 *.log
+
+# Secrets and credentials
+*.pem
+*.key
+*.p12
+
+# Backups and dumps
+*.dump
+*.sql.gz
+backups/
+
+# Terraform
+.terraform/
+*.tfstate*
