@@ -1,0 +1,124 @@
+# Caddy edge-proxy for vibestart - production entrypoint of the VPS.
+# Driven entirely by env vars ({$VAR}) from infra/edge/.env; see .env.example.
+#
+# Topology: this is the ONLY stack with ports published to the internet
+# (80/443). Every other stack (infra/supabase, backend) stays bound to
+# 127.0.0.1 or the internal `edge` Docker network and is reached here by
+# Docker service name (kong, backend) - see infra/README.md for the diagram.
+{
+	email {$ACME_EMAIL}
+}
+
+# Security headers shared by every host. Studio (behind {$SUPABASE_DOMAIN})
+# intentionally does NOT import this snippet - see that host block for why.
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+(compression) {
+	encode zstd gzip
+}
+
+# JSON access logs to stdout (captured by `docker compose logs` / any log
+# driver). Supabase REST/Storage/Realtime traffic carries `apikey` in the
+# query string, and Storage presigned URLs carry `token`/signature params -
+# both would otherwise land in plaintext logs. Redact the known-sensitive
+# keys rather than dropping the whole query string, so non-sensitive query
+# params (e.g. PostgREST filters) stay visible for debugging. Extend this
+# list if a new query-carried secret shows up.
+(access_log) {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete apikey
+					delete token
+					delete access_token
+					delete refresh_token
+					delete code
+					delete X-Amz-Signature
+					delete X-Amz-Credential
+					delete X-Amz-Security-Token
+				}
+			}
+		}
+	}
+}
+
+# --- webapp: React CSR static build (T6) ---------------------------------
+{$APP_DOMAIN} {
+	import security_headers
+	import compression
+	import access_log
+
+	# Bind-mounted read-only from ../../webapp/dist (see docker-compose.yml).
+	# Doesn't exist until T6 builds it; Docker creates an empty dir and
+	# Caddy serves 404s until then, which is fine pre-launch.
+	root * /srv/webapp
+	file_server
+
+	@hashed path_regexp hashed \.[0-9a-f]{8,}\.(js|css|woff2?|svg|png|jpe?g|webp|ico)$
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	header /index.html Cache-Control "no-cache"
+
+	try_files {path} /index.html
+}
+
+# --- website: Astro static build (T7) -------------------------------------
+{$SITE_DOMAIN} {
+	import security_headers
+	import compression
+	import access_log
+
+	# Bind-mounted read-only from ../../website/dist (see docker-compose.yml).
+	root * /srv/website
+	file_server
+	handle_errors {
+		rewrite * /404.html
+		file_server
+		# If 404.html doesn't exist (site not built yet, or Astro's default
+		# 404 wasn't included), file_server 404s again here and Caddy falls
+		# back to its built-in blank error response - no infinite loop.
+	}
+}
+
+# --- backend: Bun+Hono API (T5) -------------------------------------------
+{$API_DOMAIN} {
+	import security_headers
+	import compression
+	import access_log
+
+	# backend joins the `edge` network in T5; 502 until then is expected.
+	reverse_proxy backend:3000
+}
+
+# --- Supabase: Kong gateway (APIs at /auth,/rest,/storage,/realtime + ----
+# --- Studio dashboard at / with Kong-enforced basic-auth) -----------------
+{$SUPABASE_DOMAIN} {
+	import compression
+	import access_log
+
+	# No security_headers import here: X-Frame-Options DENY would break
+	# Studio's SQL editor / table editor, which render some panels (e.g.
+	# the AI assistant, embedded docs) in iframes. HSTS/nosniff/Referrer-
+	# Policy are still applied explicitly below - only framing is left open.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Single upstream for everything: Kong routes /auth/v1, /rest/v1,
+	# /storage/v1, /realtime/v1, and / (Studio, basic-auth enforced by
+	# Kong's `dashboard` route) - never proxy the studio container directly.
+	reverse_proxy kong:8000
+}
