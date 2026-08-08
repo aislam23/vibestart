@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Mirrors `auth.users.id` from Supabase GoTrue. No `@default` and no foreign
+/// key into the `auth` schema: GoTrue owns that schema, and the backend's
+/// tests must run without GoTrue present. `auth-context` provisions the row
+/// the first time a valid Supabase JWT is seen for a `sub` with no profile.
+///
+/// This is the ONE exception to the repository-standard id rule below.
+model Profile {
+  id          String   @id @db.Uuid
+  role        UserRole @default(user)
+  displayName String?  @map("display_name")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("profiles")
+}
+
+/// Repository-standard id rule: every OTHER app table (anything that is not
+/// mirroring a Supabase Auth user id) generates its own timestamp-ordered id
+/// with `id String @id @default(dbgenerated("uuidv7()")) @db.Uuid`. The
+/// `uuidv7()` SQL function is created once, in the first migration - see its
+/// comment there for why a hand-written implementation is needed on
+/// PostgreSQL 17.
+enum UserRole {
+  user
+  admin
+
+  @@map("user_role")
+}
