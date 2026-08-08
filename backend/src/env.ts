@@ -20,6 +20,17 @@ const optionalHttpHeaderNameSchema = z.preprocess((value) => {
   return trimmed === '' ? undefined : trimmed.toLowerCase()
 }, z.string().regex(/^[a-z0-9!#$%&'*+.^_`|~-]+$/).optional())
 
+// Docker Compose's `${VAR:-}` interpolation (infra/app/docker-compose.yml) sends an empty string,
+// not an unset key, when an operator leaves this optional variable out of infra/app/.env - treat
+// empty the same as unset, mirroring optionalHttpHeaderNameSchema above, so a default production
+// deploy that never sets this variable doesn't crash-loop the container on a bare z.enum().optional()
+// (which only accepts undefined, not '').
+const optionalTrustedProxyPositionSchema = z.preprocess((value) => {
+  if (typeof value !== 'string') return value
+  const trimmed = value.trim()
+  return trimmed === '' ? undefined : trimmed
+}, z.enum(['first', 'last']).optional())
+
 const rawEnvSchema = z
   .object({
     NODE_ENV: z.string().optional(),
@@ -55,7 +66,7 @@ const rawEnvSchema = z
     ADMIN_USERS_READ_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
     TRUST_PROXY: booleanStringSchema,
     TRUSTED_PROXY_CLIENT_IP_HEADER: optionalHttpHeaderNameSchema,
-    TRUSTED_PROXY_CLIENT_IP_POSITION: z.enum(['first', 'last']).optional(),
+    TRUSTED_PROXY_CLIENT_IP_POSITION: optionalTrustedProxyPositionSchema,
   })
 
 const envSchema = rawEnvSchema

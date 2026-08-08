@@ -96,4 +96,17 @@ describe('loadEnv', () => {
       }),
     ).toThrow('TRUSTED_PROXY_CLIENT_IP_POSITION')
   })
+
+  test('treats an empty TRUSTED_PROXY_CLIENT_IP_POSITION/HEADER as unset (Docker Compose ${VAR:-} default)', () => {
+    // infra/app/docker-compose.yml interpolates unset optional vars to '', not an absent key -
+    // a bare z.enum().optional() only accepts undefined and would crash-loop the container.
+    const env = loadEnv({
+      ...baseEnv,
+      TRUSTED_PROXY_CLIENT_IP_HEADER: '',
+      TRUSTED_PROXY_CLIENT_IP_POSITION: '',
+    })
+
+    expect(env.TRUSTED_PROXY_CLIENT_IP_HEADER).toBeUndefined()
+    expect(env.TRUSTED_PROXY_CLIENT_IP_POSITION).toBeUndefined()
+  })
 })
