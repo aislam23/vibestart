@@ -35,6 +35,7 @@
     "build:webapp": "bun run --cwd webapp build",
     "typecheck:webapp": "bun run --cwd webapp typecheck",
     "test:webapp": "bun run --cwd webapp test",
+    "e2e:webapp": "bun run --cwd webapp e2e",
     "lint": "bun run --cwd webapp lint",
     "test:architecture": "bun test scripts/architecture-check.test.mjs",
     "architecture:check": "bun run scripts/architecture-check.mjs",

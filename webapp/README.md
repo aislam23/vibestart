@@ -71,4 +71,49 @@ The route map, workspace shell, admin/user feature split, and architecture rules
 
 ## E2E
 
-Playwright E2E is not wired up yet in this workspace - it lands in a follow-up task.
+Playwright (`webapp/e2e/`) runs full-stack smoke tests: a real self-hosted Supabase stack, the
+backend, and Vite, driven through Chromium. It covers two happy-path journeys plus the RBAC
+redirects - not validation matrices (those live in backend integration tests and `webapp/tests`).
+
+- `e2e/specs/auth.spec.ts` - register via the UI (Supabase email autoconfirm is on for e2e, so
+  signup lands straight in `/app`), see the profile panel and update the display name, log out,
+  log back in; the forgot-password screen renders and accepts a request (no SMTP is configured for
+  e2e - the target email is always unregistered, so GoTrue's anti-enumeration branch returns
+  success without ever touching a mailer).
+- `e2e/specs/rbac.spec.ts` - an admin, seeded in `globalSetup`, opens `/admin`, promotes a regular
+  user from the user directory, and the change takes effect on that user's very next request (no
+  session revocation - see backend/README.md, "No session revocation on a role change"); a
+  regular user visiting `/admin` and an admin visiting `/app` both redirect home.
+
+Everything the run needs is isolated and throwaway, entirely separate from `infra/supabase`'s dev
+stack:
+
+- `docker compose -p vibestart-e2e` brings up only `db`, `auth`, and `kong` from
+  `infra/supabase/docker-compose.yml`, plus `e2e/docker-compose.e2e-override.yml` (renames the
+  three services' `container_name` and the `supabase` network so they never collide with the dev
+  stack's identically-named ones - see that file's header comment).
+- A throwaway `infra/supabase`-shaped `.env` and generated secrets live only in
+  `webapp/e2e/.artifacts/` (gitignored) - `infra/supabase/.env` is never read or written.
+- The backend runs against `backend_runtime` (activated with a freshly generated password, same as
+  a real deploy - backend/README.md, "Runtime DB role"), not the migration superuser.
+- Ports (Kong, Postgres, backend, Vite) auto-select near fixed preferred values
+  (`webapp/e2e/env.ts`/`ports.ts`) and move to the next free one if occupied.
+- `globalTeardown` runs `docker compose -p vibestart-e2e down -v` (the one place `-v` is
+  correct here - this project's volumes never hold anything worth keeping) and deletes the
+  scratch secrets; the HTML report and `test-results/` (traces/screenshots/video) survive for
+  inspection.
+
+Run it:
+
+```bash
+bun run --cwd webapp e2e:install   # once, installs the Chromium browser Playwright drives
+bun run e2e:webapp                 # from the repo root; needs Docker running
+```
+
+Useful env: `E2E_KONG_PORT` / `E2E_POSTGRES_PORT` / `E2E_BACKEND_PORT` / `E2E_WEB_PORT` (pin a
+port instead of auto-selecting), `E2E_KEEP_DOCKER=1` (skip the `docker compose down -v` teardown,
+for debugging), `E2E_KEEP_SCRATCH_FILES=1` (keep the generated `.env`/`plan.json`).
+
+Not part of the default `bun run test` chain (it needs Docker and takes noticeably longer) - run
+it as its own step, the same way `bun run test:backend:integration` is separate from
+`bun run test:backend`.

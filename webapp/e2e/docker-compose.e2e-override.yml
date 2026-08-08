@@ -1,0 +1,28 @@
+# Overrides applied on top of infra/supabase/docker-compose.yml when it is brought up as a
+# second, fully isolated compose project (`-p vibestart-e2e`, see e2e/env.ts) alongside the
+# developer's own running dev stack (project `supabase`).
+#
+# Why this file has to exist: `-p <project>` alone prefixes container, network, and volume names
+# ONLY for resources that don't already pin an explicit name. The base compose file hardcodes
+# `container_name` on every service (`supabase-db`, `supabase-auth`, ...) and gives the `supabase`
+# network an explicit top-level `name: supabase` - both bypass compose's per-project prefixing, so
+# bringing the same file up under a different `-p` while the dev stack is running would try to
+# create a second container named `supabase-db` (Docker container names must be unique on the
+# host) and attach to the dev stack's own `supabase` network. This override renames only the three
+# services e2e actually starts - `db`, `auth`, `kong` (global-setup.ts never brings up `rest`,
+# `realtime`, `storage`, `imgproxy`, `meta`, or `studio`: nothing in the webapp/backend auth or
+# RBAC path touches them, and skipping them sidesteps their own container-name collisions too,
+# without needing to rename services this project never starts) - and gives the network its own
+# name, so the two stacks never share a container name, network, or (via `-p`, already handled
+# without this file) volume set.
+services:
+  db:
+    container_name: vibestart-e2e-db
+  auth:
+    container_name: vibestart-e2e-auth
+  kong:
+    container_name: vibestart-e2e-kong
+
+networks:
+  supabase:
+    name: vibestart-e2e-network
