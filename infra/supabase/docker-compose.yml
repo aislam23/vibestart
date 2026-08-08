@@ -327,9 +327,12 @@ services:
 
       # Analytics disabled: no Logflare/Vector service in this stack.
       ENABLED_FEATURES_LOGS_ALL: "false"
-    # Internal only by default - the T3 Caddy edge-proxy stack will route to
-    # Studio once it lands. Uncomment for direct local access in the
-    # meantime (http://localhost:54323):
+    # Internal only, and stays that way: Studio is never attached to the
+    # `edge` network directly. Once T3's Caddy proxy lands, it must reach
+    # Studio only through Kong (`dashboard` route in kong.yml, which
+    # enforces DASHBOARD_USERNAME/PASSWORD basic-auth) - never straight to
+    # this container. Uncomment for direct local access in the meantime
+    # (http://localhost:54323):
     # ports:
     #   - "127.0.0.1:54323:3000"
     networks:
@@ -339,9 +342,13 @@ services:
     container_name: supabase-kong
     image: kong/kong:3.9.3
     restart: unless-stopped
-    depends_on:
-      studio:
-        condition: service_healthy
+    # No depends_on studio: kong is the gateway and must come up on its own;
+    # it must never be gated by an unrelated service's health.
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
     # Bound to loopback only: no public TLS here. T3's Caddy edge-proxy
     # stack terminates TLS and reverse-proxies to this port.
     ports:
@@ -359,7 +366,9 @@ services:
       KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
       KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
       KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
-      KONG_PROXY_ACCESS_LOG: /dev/stdout combined
+      # Off by default: query strings carry apikey and presigned-URL
+      # signatures. Set to "/dev/stdout combined" temporarily for debugging.
+      KONG_PROXY_ACCESS_LOG: "off"
       SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
       # Opaque API keys / asymmetric JWTs: optional newer auth mode, unused
@@ -384,9 +393,11 @@ networks:
   supabase:
     name: supabase
   # T3 (Caddy edge-proxy) creates this network externally and attaches to
-  # it, plus attaches kong/studio to it (see the commented `networks:`
-  # blocks on those two services above). Declared here only as documentation
-  # - it is NOT active, so `docker compose up` never requires it to exist.
+  # it, plus attaches kong to it (see the commented `networks:` block on
+  # that service above). Only kong ever joins `edge` - Studio is reached
+  # exclusively through Kong, never directly. Declared here only as
+  # documentation - it is NOT active, so `docker compose up` never requires
+  # it to exist.
   # edge:
   #   external: true
   #   name: edge

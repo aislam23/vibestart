@@ -359,24 +359,11 @@ services:
   ## Analytics (Logflare/Vector) routes removed: this stack ships without
   ## analytics/log aggregation. See infra/supabase/README.md.
 
-  ## Secure Database routes
-  - name: meta
-    _comment: 'pg-meta: /pg/* -> http://pg-meta:8080/*'
-    url: http://meta:8080/
-    routes:
-      - name: meta-all
-        strip_path: true
-        paths:
-          - /pg/
-    plugins:
-      - name: key-auth
-        config:
-          hide_credentials: false
-      - name: acl
-        config:
-          hide_groups_header: true
-          allow:
-            - admin
+  ## Public /pg/ (postgres-meta) route removed: Studio reaches meta
+  ## internally via STUDIO_PG_META_URL (http://meta:8080), so the public
+  ## route added no functionality, only surface. Re-add from upstream
+  ## kong.yml (service `meta`, route `/pg/`) behind basic-auth if external
+  ## SQL tooling is ever needed. See infra/supabase/README.md.
 
   ## Block access to /api/mcp
   - name: mcp-blocker
