@@ -1,0 +1,53 @@
+---
+import { Blocks, Layers3, Palette } from 'lucide-react'
+
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import SectionIntro from './SectionIntro.astro'
+
+const roles = [
+  {
+    icon: Palette,
+    title: 'You describe the outcome',
+    description: 'Describe the screen or scenario you need, check the result, and decide what happens next.',
+  },
+  {
+    icon: Blocks,
+    title: 'The agent changes the code',
+    description: 'The agent finds the right part of the project, makes the change, runs checks, and shows you the result.',
+  },
+  {
+    icon: Layers3,
+    title: 'The template sets the rules',
+    description: 'The stack is already chosen, the parts of the project are wired together, and it documents where and how the agent should change the code.',
+  },
+]
+---
+
+<section class="border-b py-20 sm:py-24" id="features" aria-labelledby="features-title">
+  <div class="site-container">
+    <div>
+      <SectionIntro
+        align="center"
+        eyebrow="Who does what"
+        title="You decide what to build. The agent makes the changes."
+        titleId="features-title"
+        description="The template gives you a ready technical foundation: you don't have to choose the stack, and the agent already knows where and how to change the code."
+      />
+    </div>
+    <div class="mt-12 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      {roles.map(({ icon: Icon, title, description }) => (
+        <Card className="h-full transition-all duration-200 hover:-translate-y-1 hover:ring-white/25">
+          <CardHeader>
+            <span class="mb-3 grid size-10 place-items-center rounded-xl bg-white/10 text-white">
+              <Icon className="size-5" aria-hidden="true" />
+            </span>
+            <CardTitle className="text-lg font-bold">{title}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p class="leading-6 text-muted-foreground">{description}</p>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  </div>
+</section>

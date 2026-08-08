@@ -35,7 +35,8 @@ ENV NODE_ENV=production
 
 USER bun
 
-# Joins the `edge` Docker network in the app's docker-compose.yml (added separately) so Caddy
-# (infra/edge) can reverse-proxy to this container; not declared here since this Dockerfile only
-# builds the image.
+# Joins the `edge` and `supabase` Docker networks in infra/app/docker-compose.yml (the compose
+# project that actually runs this image in production) so Caddy (infra/edge) can reverse-proxy to
+# this container and it can reach Postgres/Kong by service name; not declared here since this
+# Dockerfile only builds the image.
 CMD ["bun", "src/index.ts"]

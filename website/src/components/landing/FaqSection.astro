@@ -1,0 +1,59 @@
+---
+import { Plus } from 'lucide-react'
+
+import SectionIntro from './SectionIntro.astro'
+
+const questions = [
+  {
+    question: 'Can I start without programming experience?',
+    answer: "Yes, if you start with small tasks. Describe the text, screen, or scenario you need. The agent makes the change following the template's own rules. Your part is to check the result and decide what's next.",
+  },
+  {
+    question: 'How does the agent know what to change?',
+    answer: 'The project documents where its parts live, how they connect, and which checks to run. The agent follows those rules when it looks for the right code, makes a change, and verifies the result.',
+  },
+  {
+    question: 'What can I build with it?',
+    answer: 'A landing page, a web app, and a backend with authentication and a database. Use only the part you need now and connect the rest later.',
+  },
+  {
+    question: 'What stack does it already use?',
+    answer: 'Astro and Tailwind CSS for the landing page, React and Vite for the web app, and Hono, Prisma, and PostgreSQL for the backend, running on a self-hosted Supabase stack.',
+  },
+  {
+    question: "How are the agent's changes checked?",
+    answer: "The agent picks and runs the right automated checks - linting, tests, or a build - and shows you the results. That catches a lot of mistakes, but it doesn't replace reviewing the page or scenario yourself before you publish.",
+  },
+  {
+    question: 'When do I need a developer?',
+    answer: "For a first version and small changes, you don't need programming experience. Before you launch payments, handle personal data, or add complex integrations, bring in a developer.",
+  },
+]
+---
+
+<section class="border-b bg-muted/35 py-20 sm:py-24" id="faq" aria-labelledby="faq-title">
+  <div class="site-container grid gap-12 lg:grid-cols-[0.72fr_1.28fr] lg:gap-20">
+    <div class="lg:sticky lg:top-28 lg:self-start">
+      <SectionIntro
+        eyebrow="FAQ"
+        title="What to know before you start"
+        titleId="faq-title"
+        description="A quick rundown of what's in the template, how work with the agent goes, and how to check the result."
+      />
+    </div>
+
+    <div class="overflow-hidden rounded-2xl border bg-card px-5 sm:px-7">
+      {questions.map(({ question, answer }, index) => (
+        <details class:list={['group py-5 sm:py-6', index > 0 && 'border-t']}>
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-6 font-heading text-base font-bold focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:text-lg [&::-webkit-details-marker]:hidden">
+            {question}
+            <span class="grid size-8 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 transition-transform duration-200 group-open:rotate-45">
+              <Plus className="size-4" aria-hidden="true" />
+            </span>
+          </summary>
+          <p class="max-w-2xl pt-4 pr-12 leading-7 text-muted-foreground">{answer}</p>
+        </details>
+      ))}
+    </div>
+  </div>
+</section>

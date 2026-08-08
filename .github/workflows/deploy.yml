@@ -1,0 +1,198 @@
+# Builds and publishes the backend image, then deploys both static sites
+# and the backend to the production VPS over SSH. Two jobs:
+#
+# - `build-push`: builds backend/Dockerfile from the repo root (the Docker
+#   context, since the image copies packages/contracts alongside backend/ -
+#   see backend/Dockerfile's own comment) and pushes it to GHCR under
+#   `ghcr.io/<owner>/<repo>-backend`, tagged with the commit sha always, and
+#   additionally with the git tag + `latest` when triggered by a version
+#   tag (not on a manual workflow_dispatch run from an arbitrary branch -
+#   that should never silently become the new `latest`).
+# - `deploy` (environment: `production`, needs `build-push`): builds the
+#   webapp and website static bundles in CI, rsyncs both dist/ directories
+#   to the paths infra/edge's Caddy bind-mounts on the VPS, then over the
+#   same SSH connection: writes ONLY the fresh BACKEND_IMAGE tag to a small
+#   CI-owned `infra/app/image.env` file (atomically - write + rename, never
+#   a partial file readable mid-write), pulls the new image, runs the
+#   database migration, rolls `backend` to the new image, and polls its
+#   Docker healthcheck until it reports healthy or the job times out.
+#   `infra/app/.env` (the real secrets file) is never written by this
+#   workflow - see infra/app/README.md and .env.example for how it's
+#   provisioned once, by hand, on first deploy.
+#
+# See .github/workflows/README.md for every secret/variable this workflow
+# needs and how to provision them.
+
+name: Deploy
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-push:
+    name: Build and push backend image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.tags.outputs.primary }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires a lowercase image name; github.repository preserves
+      # whatever case the owner/repo actually have.
+      - name: Compute image tags
+        id: tags
+        run: |
+          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-backend"
+          sha_tag="$image:${{ github.sha }}"
+          {
+            echo "tags<<TAGEOF"
+            echo "$sha_tag"
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              echo "$image:${{ github.ref_name }}"
+              echo "$image:latest"
+            fi
+            echo "TAGEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "primary=$sha_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to production
+    needs: build-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # PUBLIC_*/VITE_* build-time env - see .github/workflows/README.md for
+      # what each one maps to (webapp/.env.example, website's
+      # PUBLIC_WEBSITE_URL/PUBLIC_WEBAPP_URL usage in website/src/pages/index.astro).
+      - name: Build webapp
+        working-directory: webapp
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+        run: bun run build
+
+      - name: Build website
+        working-directory: website
+        env:
+          PUBLIC_WEBSITE_URL: ${{ vars.PUBLIC_WEBSITE_URL }}
+          PUBLIC_WEBAPP_URL: ${{ vars.PUBLIC_WEBAPP_URL }}
+        run: bun run build
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pinned ahead of time (`ssh-keyscan <host>`, stored as a secret),
+          # not re-scanned here - scanning at deploy time trusts whatever
+          # host key answers on first connect, which is exactly the MITM
+          # this pin exists to prevent. See .github/workflows/README.md.
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync static builds
+        env:
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          rsync_ssh="ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts"
+          # --delete: hashed, content-addressed filenames (see
+          # infra/edge/Caddyfile's immutable-cache rule) accumulate forever
+          # otherwise - a stale asset lingering is harmless but unbounded.
+          rsync -az --delete -e "$rsync_ssh" webapp/dist/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/webapp/dist/"
+          rsync -az --delete -e "$rsync_ssh" website/dist/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/website/dist/"
+
+      - name: Deploy backend
+        env:
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          BACKEND_IMAGE: ${{ needs.build-push.outputs.image }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "$SSH_USER@$SSH_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' BACKEND_IMAGE='$BACKEND_IMAGE' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+
+          compose="docker compose -f infra/app/docker-compose.yml --env-file infra/app/.env --env-file infra/app/image.env"
+
+          # Atomic: a concurrent `docker compose` read of image.env (this
+          # deploy racing a manual `make app-*` on the box) never sees a
+          # half-written file - write to a temp file in the same directory,
+          # then rename (POSIX rename is atomic on the same filesystem).
+          printf 'BACKEND_IMAGE=%s\n' "$BACKEND_IMAGE" > infra/app/image.env.tmp
+          mv infra/app/image.env.tmp infra/app/image.env
+
+          $compose pull backend
+          $compose run --rm backend bun run prisma:deploy
+          $compose up -d backend
+
+          echo "Waiting for backend healthcheck..."
+          for _ in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' vibestart-backend 2>/dev/null || echo "starting")
+            if [ "$status" = "healthy" ]; then
+              echo "backend is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "backend did not become healthy in time" >&2
+          docker logs --tail 100 vibestart-backend >&2 || true
+          exit 1
+          REMOTE
+
+      # Caddy needs no action here: static file changes are picked up on
+      # the next request (no in-memory cache of file contents to reload -
+      # see infra/edge/Caddyfile's `file_server` directive), and the
+      # backend upstream is resolved by Docker DNS per-request, so
+      # recreating the `backend` container above needs no Caddy restart or
+      # config reload either.

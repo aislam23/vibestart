@@ -10,7 +10,9 @@ ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SUPABASE_DIR := $(ROOT_DIR)/infra/supabase
 EDGE_DIR := $(ROOT_DIR)/infra/edge
 BACKUP_DIR := $(ROOT_DIR)/infra/backup
+APP_DIR := $(ROOT_DIR)/infra/app
 BACKUP_COMPOSE := docker compose -f "$(BACKUP_DIR)/docker-compose.yml"
+APP_COMPOSE := docker compose -f "$(APP_DIR)/docker-compose.yml"
 
 .DEFAULT_GOAL := help
 
@@ -51,24 +53,49 @@ edge-up: ensure-network ## Start the Caddy edge stack
 edge-down: ## Stop the Caddy edge stack (keeps volumes - never -v here)
 	cd "$(EDGE_DIR)" && docker compose down
 
+.PHONY: app-up
+app-up: ensure-network ## Start the backend production stack (infra/app)
+	cd "$(APP_DIR)" && docker compose up -d
+
+.PHONY: app-down
+app-down: ## Stop the backend production stack
+	cd "$(APP_DIR)" && docker compose down
+
+.PHONY: app-logs
+app-logs: ## Tail logs for the backend production stack
+	cd "$(APP_DIR)" && docker compose logs -f
+
+.PHONY: app-migrate
+app-migrate: ## Apply backend/prisma/migrations against MIGRATE_DATABASE_URL (see infra/app/README.md)
+	$(APP_COMPOSE) run --rm backend bun run prisma:deploy
+
 # up/down use $(MAKE) calls in a single recipe body (not prerequisites) so
 # the steps run strictly sequentially even under `make -j` - prerequisites
-# are allowed to parallelize, a single recipe's lines never are.
+# are allowed to parallelize, a single recipe's lines never are. Order:
+# network -> supabase -> app -> edge (app-migrate is deliberately not part
+# of this chain - a schema migration is never something `make up` should
+# run silently on every start; run `make app-migrate` by hand, see
+# infra/app/README.md, "First deploy").
 .PHONY: up
-up: ## Start both stacks (supabase, then edge)
+up: ## Start all stacks (supabase, then app, then edge)
 	@$(MAKE) ensure-network
 	@$(MAKE) supabase-up
+	@$(MAKE) app-up
 	@$(MAKE) edge-up
 
 .PHONY: down
-down: ## Stop both stacks (edge, then supabase - reverse of up)
+down: ## Stop all stacks (edge, then app, then supabase - reverse of up)
 	@$(MAKE) edge-down
+	@$(MAKE) app-down
 	@$(MAKE) supabase-down
 
 .PHONY: status
 status: ## Show container status for all stacks + docker volume disk usage
 	@echo "== supabase =="
 	@out=$$(cd "$(SUPABASE_DIR)" && docker compose ps 2>&1); code=$$?; \
+	  if [ $$code -ne 0 ]; then echo "warning: $$out"; else echo "$$out"; fi
+	@echo "== app =="
+	@out=$$(cd "$(APP_DIR)" && docker compose ps 2>&1); code=$$?; \
 	  if [ $$code -ne 0 ]; then echo "warning: $$out"; else echo "$$out"; fi
 	@echo "== edge =="
 	@out=$$(cd "$(EDGE_DIR)" && docker compose ps 2>&1); code=$$?; \
@@ -131,6 +158,7 @@ pre-restore-snapshot: ## Host-side safety net before a restore: tar db-data+db-c
 	echo "  docker run --rm -v supabase_db-data:/dest/db-data -v supabase_db-config:/dest/db-config -v $(PRE_RESTORE_DIR):/src alpine:3.22 sh -c 'rm -rf /dest/db-data/* /dest/db-config/* && tar xzf /src/pre-restore-$$ts.tar.gz -C /dest'"
 
 .PHONY: deploy
-deploy: ## [not implemented] Deploy to the VPS - see .github (T7)
-	@echo "not implemented yet — see infra/backup (T4) / .github (T7)" >&2
+deploy: ## Deploy is not a local Makefile target - see .github/workflows/deploy.yml
+	@echo "deploy runs in CI, not locally - push a v* tag or trigger .github/workflows/deploy.yml manually (workflow_dispatch)." >&2
+	@echo "See .github/workflows/README.md for the required secrets/vars, and infra/app/README.md for the manual equivalent (app-migrate + app-up)." >&2
 	@exit 1

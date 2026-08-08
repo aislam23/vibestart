@@ -26,6 +26,9 @@ bun-debug.log*
 !website/.env*.example
 !**/.env.example
 infra/**/.env
+# Written on the VPS by .github/workflows/deploy.yml (see infra/app/README.md,
+# "Deploying from CI") - never committed, holds only the current BACKEND_IMAGE tag.
+infra/app/image.env
 
 # Prisma generated client
 backend/src/generated/prisma/

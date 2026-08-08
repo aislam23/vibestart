@@ -1,0 +1,53 @@
+---
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
+import SectionIntro from './SectionIntro.astro'
+
+const steps = [
+  {
+    number: '01',
+    title: 'Describe the product',
+    description: "Who will use it, what problem it solves, and what the user should be able to do first.",
+  },
+  {
+    number: '02',
+    title: 'Give the agent one task',
+    description: 'For example: build the main screen, add a signup form, or wire up data. The agent makes the change and runs checks.',
+  },
+  {
+    number: '03',
+    title: 'Review the result',
+    description: 'Open the page or app. If the scenario works as intended and the checks pass, move on to the next task.',
+  },
+]
+---
+
+<section class="border-b bg-muted/35 py-20 sm:py-24" id="process" aria-labelledby="process-title">
+  <div class="site-container grid gap-12 lg:grid-cols-[0.8fr_1.2fr] lg:gap-16">
+    <div>
+      <SectionIntro
+        eyebrow="Where to start"
+        title="Your first testable task, in three steps"
+        titleId="process-title"
+        description="Describe the product, give the agent one concrete task, and check the result. Then move on to the next feature."
+      />
+    </div>
+    <ol class="grid gap-4">
+      {steps.map((step) => (
+        <li>
+          <Card className="py-0">
+            <CardContent className="grid gap-4 p-5 sm:grid-cols-[auto_1fr] sm:items-start sm:p-6">
+              <Badge className="h-8 min-w-11 font-bold tabular-nums" variant="secondary">
+                {step.number}
+              </Badge>
+              <div>
+                <h3 class="font-heading text-lg font-bold">{step.title}</h3>
+                <p class="mt-2 leading-6 text-muted-foreground">{step.description}</p>
+              </div>
+            </CardContent>
+          </Card>
+        </li>
+      ))}
+    </ol>
+  </div>
+</section>

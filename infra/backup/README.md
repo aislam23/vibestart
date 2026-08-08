@@ -407,7 +407,9 @@ silent gap. Set it up before relying on this in production.
 
 ## Testing
 
-A CI job that runs the full MinIO backup→restore cycle automatically on
-every push is planned in the repository's CI (T7) - this README's manual
-drill above is the interim procedure until that lands; keep this note in
-sync with T7 when it does.
+Not automated in CI (`.github/workflows/ci.yml`, added in T7, covers
+typecheck/lint/unit/integration/e2e/build for `backend`/`webapp`/`website`
+only - it does not exercise this stack). The manual restore drill above
+remains the only tested path; a CI job that runs the full MinIO
+backup→restore cycle automatically on every push is a reasonable future
+addition, not implemented here.

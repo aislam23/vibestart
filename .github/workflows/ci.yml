@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Cache bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-install-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            bun-install-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
+
+      # Unit tests for every workspace + scripts/architecture-check.mjs (contracts, backend,
+      # webapp, website, then the architecture boundary check itself - see the root package.json's
+      # `test` script). No Docker needed here - see backend/README.md's "Testing" for why the unit
+      # layer never touches a database.
+      - name: Test (unit + architecture check)
+        run: bun run test
+
+      # Separate step, not folded into `bun run test` above: needs Docker (backend/docker-compose.test.yml)
+      # and takes longer - see backend/README.md's "Testing", "Integration". ubuntu-latest ships
+      # Docker Engine + the Compose v2 plugin preinstalled, and every path this script drives
+      # (backend/scripts/test-integration.mjs) is already Linux-only (loopback bind, docker compose
+      # CLI) - no macOS-only assumptions to unwind.
+      - name: Backend integration tests
+        run: bun run test:backend:integration
+
+      # Builds every workspace (contracts, backend, webapp, website) - see the root package.json's
+      # `build` script. Doesn't need real Supabase/backend env vars: webapp's Vite build and
+      # website's Astro build both have safe fallbacks/optional env (see webapp/src/env.d.ts and
+      # website/src/pages/index.astro's PUBLIC_WEBSITE_URL/PUBLIC_WEBAPP_URL handling), and
+      # backend's build only runs `prisma generate` + `tsc --noEmit` (backend/prisma.config.ts
+      # falls back to a placeholder DATABASE_URL when unset - no real database required to generate
+      # the Prisma client).
+      - name: Build
+        run: bun run build
+
+  e2e:
+    name: Webapp e2e (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Cache bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-install-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            bun-install-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Keyed on bun.lock (which pins @playwright/test's exact version) - a lockfile bump that
+      # changes the Playwright version naturally busts this cache instead of silently reusing
+      # mismatched browser binaries.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
+      # webapp/e2e brings up a throwaway, isolated Supabase stack (docker compose -p vibestart-e2e,
+      # see webapp/e2e/env.ts + docker-compose.e2e-override.yml) and runs backend+webapp dev
+      # servers itself via Playwright's `webServer` config - ubuntu-latest's preinstalled Docker
+      # Engine covers the compose side; nothing here needs a self-hosted runner.
+      - name: Run webapp e2e
+        run: bun run e2e:webapp
+        env:
+          CI: true
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: webapp/e2e/.artifacts/report
+          retention-days: 7
+          if-no-files-found: ignore

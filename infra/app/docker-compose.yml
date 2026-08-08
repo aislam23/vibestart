@@ -1,0 +1,98 @@
+# Production compose stack for vibestart's own services - currently just the
+# Bun+Hono backend API. Not internet-facing on its own: it joins the shared
+# `edge` Docker network (so infra/edge's Caddy can reverse-proxy to it by
+# service name, see infra/edge/Caddyfile's `{$API_DOMAIN}` block) and the
+# `supabase` network (so it can reach Postgres/Kong by service name - see
+# infra/README.md's topology diagram). Both networks are provisioned by
+# their owning stacks (`make ensure-network`, `infra/supabase`), not by this
+# file - declared here as external only.
+#
+# The image itself (`backend/Dockerfile`) is built and pushed to GHCR by
+# `.github/workflows/deploy.yml`, not by this compose file - `BACKEND_IMAGE`
+# always points at an already-published `ghcr.io/<owner>/<repo>-backend:<tag>`
+# reference. Building locally for manual testing: see backend/README.md and
+# infra/app/README (docker build -f backend/Dockerfile -t vibestart-backend:local .).
+#
+# Usage:
+#   cp .env.example .env      # fill in real values (see infra/README.md, "First run")
+#   docker compose up -d      # from this directory (or `make app-up`)
+#   docker compose run --rm backend bun run prisma:deploy   # or `make app-migrate`
+
+name: app
+
+services:
+  backend:
+    container_name: vibestart-backend
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required - e.g. ghcr.io/<owner>/<repo>-backend:latest}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    env_file:
+      - .env
+    healthcheck:
+      # No wget/curl in the oven/bun base image (Debian slim) - bun itself
+      # (with its built-in fetch) is the only HTTP client guaranteed to be
+      # on PATH. An unhandled promise rejection (the .catch below, or a
+      # non-ok response via process.exit(1)) exits non-zero, same contract
+      # docker expects from any other healthcheck command.
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - edge
+      - supabase
+
+  # Uncomment to run schedules (src/scheduler.ts) as a long-running sibling
+  # process from the same image, instead of / in addition to an external
+  # cron trigger calling `bun run start:cron -- <job>`. Ships empty
+  # (backend/src/jobs.ts has no schedules registered) - the process exits
+  # immediately with an empty `schedules` map, so leave this commented out
+  # until a real scheduled job exists. See backend/README.md, "Background
+  # jobs", for the trade-offs between cron.ts/scheduler.ts/worker.ts.
+  # scheduler:
+  #   container_name: vibestart-scheduler
+  #   image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+  #   restart: unless-stopped
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   read_only: true
+  #   tmpfs:
+  #     - /tmp
+  #   env_file:
+  #     - .env
+  #   command: ["bun", "run", "start:scheduler"]
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "5"
+  #   networks:
+  #     - supabase
+
+networks:
+  # Provisioned independently of any single stack (`make ensure-network` /
+  # `docker network create edge`) - see infra/README.md.
+  edge:
+    external: true
+    name: edge
+  # Provisioned by infra/supabase/docker-compose.yml (`name: supabase`) -
+  # see infra/backup/docker-compose.yml for the same external-attach pattern.
+  supabase:
+    external: true
+    name: supabase
