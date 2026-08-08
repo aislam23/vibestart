@@ -3,8 +3,19 @@ import { fileURLToPath } from 'node:url'
 
 import { backendRoot } from './e2e/env'
 import { resolveAndPersistE2ePlan } from './e2e/plan'
+import { acquireRunLock } from './e2e/run-lock'
 
 const frontendRoot = fileURLToPath(new URL('.', import.meta.url))
+
+// Acquired here, before `resolveAndPersistE2ePlan()` - not inside globalSetup, which per
+// plan.ts's doc comment runs too late to help: a second, concurrent invocation reaches THIS same
+// config-eval step first, reuses the first run's still-on-disk plan.json (same ports), and fails
+// with a confusing "port already in use" error from Playwright's own `webServer` startup well
+// before globalSetup ever gets a chance to run. Acquiring the lock here instead means a
+// concurrent run fails fast with a clear message before touching the plan, ports, or Docker at
+// all. See run-lock.ts; released in global-teardown.ts (and, if globalSetup itself throws before
+// teardown ever runs, in global-setup.ts's own catch block).
+acquireRunLock()
 
 // Computed once, here, before `webServer` below is built - see plan.ts's doc comment for why this
 // has to happen at config-eval time rather than inside globalSetup.

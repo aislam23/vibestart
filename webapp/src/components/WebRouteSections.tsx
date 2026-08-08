@@ -65,6 +65,21 @@ export function SessionErrorSection({ retry }: { retry: () => Promise<void> }) {
   )
 }
 
+export function AuthCallbackErrorSection({ description }: { description: string }) {
+  return (
+    <RouteStateCard
+      alert
+      description={description}
+      icon={Alert02Icon}
+      title="Sign-in link didn't work"
+    >
+      <Button asChild>
+        <Link search={{ returnTo: undefined }} to="/login">Back to sign in</Link>
+      </Button>
+    </RouteStateCard>
+  )
+}
+
 export function NotFoundSection({ destination }: { destination: HomeDestination }) {
   const authenticated = destination !== '/login'
 

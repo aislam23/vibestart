@@ -72,14 +72,20 @@ The route map, workspace shell, admin/user feature split, and architecture rules
 ## E2E
 
 Playwright (`webapp/e2e/`) runs full-stack smoke tests: a real self-hosted Supabase stack, the
-backend, and Vite, driven through Chromium. It covers two happy-path journeys plus the RBAC
-redirects - not validation matrices (those live in backend integration tests and `webapp/tests`).
+backend, and Vite, driven through Chromium. It covers a handful of end-to-end journeys plus the
+RBAC redirects - not validation matrices (those live in backend integration tests and
+`webapp/tests`).
 
 - `e2e/specs/auth.spec.ts` - register via the UI (Supabase email autoconfirm is on for e2e, so
   signup lands straight in `/app`), see the profile panel and update the display name, log out,
   log back in; the forgot-password screen renders and accepts a request (no SMTP is configured for
   e2e - the target email is always unregistered, so GoTrue's anti-enumeration branch returns
-  success without ever touching a mailer).
+  success without ever touching a mailer); a full password-recovery round trip through a *real*
+  recovery link - since there is no SMTP/mailbox to read one out of, it is generated directly via
+  GoTrue's admin API (`POST /auth/v1/admin/generate_link`, service-role authorized) with the same
+  `redirect_to` the app itself sends, so the browser actually follows the link through the PKCE
+  code exchange and `/auth/callback` route a real email would, lands on `/reset-password`, sets a
+  new password, and logs in with it.
 - `e2e/specs/rbac.spec.ts` - an admin, seeded in `globalSetup`, opens `/admin`, promotes a regular
   user from the user directory, and the change takes effect on that user's very next request (no
   session revocation - see backend/README.md, "No session revocation on a role change"); a
@@ -93,7 +99,12 @@ stack:
   three services' `container_name` and the `supabase` network so they never collide with the dev
   stack's identically-named ones - see that file's header comment).
 - A throwaway `infra/supabase`-shaped `.env` and generated secrets live only in
-  `webapp/e2e/.artifacts/` (gitignored) - `infra/supabase/.env` is never read or written.
+  `webapp/e2e/.artifacts/` (gitignored) - `infra/supabase/.env` is never read or written. Every
+  `docker compose` invocation in `global-setup.ts`/`global-teardown.ts` runs with an explicit,
+  closed process env built from that same generated plan (`e2e/plan.ts`'s `composeEnv`) instead of
+  inheriting the orchestrator's own `process.env` - `docker compose` prefers the shell environment
+  over `--env-file` for `${VAR}` interpolation, so inheriting it would let a leftover host-shell
+  `POSTGRES_PASSWORD`/`JWT_SECRET`/etc. silently override this run's generated ones.
 - The backend runs against `backend_runtime` (activated with a freshly generated password, same as
   a real deploy - backend/README.md, "Runtime DB role"), not the migration superuser.
 - Ports (Kong, Postgres, backend, Vite) auto-select near fixed preferred values
@@ -102,6 +113,12 @@ stack:
   correct here - this project's volumes never hold anything worth keeping) and deletes the
   scratch secrets; the HTML report and `test-results/` (traces/screenshots/video) survive for
   inspection.
+- **Runs are serialized per machine** (`e2e/run-lock.ts`): `global-setup.ts` takes an exclusive
+  lock file (`e2e/.artifacts/run.lock`, `O_EXCL`-based) before touching Docker, so a second,
+  concurrent `bun run e2e:webapp` fails fast with a clear message instead of both runs fighting
+  over the same fixed `vibestart-e2e` project/container names. A lock left behind by a run that was
+  killed before its own teardown ran is detected as stale (its recorded pid is no longer alive, or
+  it is simply older than any real run should take) and reclaimed automatically.
 
 Run it:
 
@@ -113,6 +130,10 @@ bun run e2e:webapp                 # from the repo root; needs Docker running
 Useful env: `E2E_KONG_PORT` / `E2E_POSTGRES_PORT` / `E2E_BACKEND_PORT` / `E2E_WEB_PORT` (pin a
 port instead of auto-selecting), `E2E_KEEP_DOCKER=1` (skip the `docker compose down -v` teardown,
 for debugging), `E2E_KEEP_SCRATCH_FILES=1` (keep the generated `.env`/`plan.json`).
+`E2E_KEEP_DOCKER=1` always implies keeping the scratch files too - deleting them while the stack
+they describe stays running would leave a later run with no way to reattach to it, generating a
+conflicting new plan instead - so teardown rejects `E2E_KEEP_DOCKER=1` combined with
+`E2E_KEEP_SCRATCH_FILES` explicitly set to anything other than `1`.
 
 Not part of the default `bun run test` chain (it needs Docker and takes noticeably longer) - run
 it as its own step, the same way `bun run test:backend:integration` is separate from

@@ -15,8 +15,14 @@ type CreateAuthenticatedTransportOptions = {
   getAccessToken: () => Promise<string | null>
   /** Forces a refresh and returns the new access token, or null when the session cannot be revived. */
   refreshAccessToken: () => Promise<string | null>
-  /** Called once a refreshed token still gets a 401 - the session is treated as gone. */
+  /** Called when the session cannot be revived: either `refreshAccessToken` returned null, or the
+   * retried request with a freshly refreshed token still gets a 401. Either way the session is
+   * treated as gone. */
   onAuthExpired?: () => void | Promise<void>
+  /** Called on a 403 from an already-authenticated request - the token is valid but the principal
+   * no longer has permission (e.g. an admin demoted while a tab stayed open). Distinct from
+   * `onAuthExpired`: the session itself is still fine, only the caller's authorization changed. */
+  onForbidden?: () => void | Promise<void>
   http?: HttpClient
 }
 
@@ -31,8 +37,23 @@ export function createAuthenticatedTransport({
   getAccessToken,
   refreshAccessToken,
   onAuthExpired,
+  onForbidden,
   http = new HttpClient(),
 }: CreateAuthenticatedTransportOptions): AuthenticatedTransport {
+  // Deduplicates `onAuthExpired` across requests that fail concurrently (e.g. several queries in
+  // flight when the session dies) - without this, N concurrently-failing requests would each call
+  // it once. The in-flight promise is cleared once it settles, not kept forever, so a later, wholly
+  // separate expiry (a fresh sign-in that itself later expires) still notifies again.
+  let authExpiredNotification: Promise<void> | null = null
+  const notifyAuthExpired = () => {
+    if (!authExpiredNotification) {
+      authExpiredNotification = Promise.resolve(onAuthExpired?.()).finally(() => {
+        authExpiredNotification = null
+      })
+    }
+    return authExpiredNotification
+  }
+
   async function performRequest<TSchema extends z.ZodType>(
     path: string,
     schema: TSchema,
@@ -46,7 +67,19 @@ export function createAuthenticatedTransport({
     try {
       return await http.request(path, schema, { ...options, headers })
     } catch (error) {
-      if (!(error instanceof ApiRequestError) || error.status !== 401 || isRetry) {
+      if (!(error instanceof ApiRequestError)) throw error
+
+      if (error.status === 403) {
+        await onForbidden?.()
+        throw error
+      }
+
+      if (error.status !== 401) throw error
+
+      if (isRetry) {
+        // The retry (already on a freshly refreshed token) still got a 401 - the session is gone,
+        // not just stale.
+        await notifyAuthExpired()
         throw error
       }
 
@@ -55,7 +88,7 @@ export function createAuthenticatedTransport({
       // whatever store `getAccessToken` reads from by the time this retry fires.
       const refreshedToken = await refreshAccessToken()
       if (!refreshedToken) {
-        await onAuthExpired?.()
+        await notifyAuthExpired()
         throw error
       }
 

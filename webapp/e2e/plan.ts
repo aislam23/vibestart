@@ -10,11 +10,13 @@ export type E2ePlan = {
   backendPort: number
   backendRuntimePassword: string
   backendUrl: string
+  dashboardPassword: string
   jwtSecret: string
   kongPort: number
   postgresPassword: string
   postgresPort: number
   runtimeDatabaseUrl: string
+  serviceRoleKey: string
   superuserDatabaseUrl: string
   supabaseUrl: string
   webPort: number
@@ -77,6 +79,8 @@ export async function resolveAndPersistE2ePlan(): Promise<E2ePlan> {
     jwtSecret: secrets.jwtSecret,
     postgresPassword: secrets.postgresPassword,
     backendRuntimePassword: secrets.backendRuntimePassword,
+    serviceRoleKey: secrets.serviceRoleKey,
+    dashboardPassword: secrets.dashboardPassword,
     superuserDatabaseUrl,
     runtimeDatabaseUrl,
   }
@@ -92,6 +96,64 @@ export function readE2ePlan(): E2ePlan {
   return JSON.parse(readFileSync(planFilePath, 'utf8')) as E2ePlan
 }
 
+/**
+ * The `docker compose` interpolation variables that the `db`, `auth`, and `kong` services - the
+ * only ones global-setup.ts ever brings up - actually read from the environment, keyed exactly as
+ * `infra/supabase/docker-compose.yml`'s `${VAR}` references expect. Exported (not just inlined
+ * into {@link buildSupabaseEnvContent} below) because {@link composeEnv} also needs it - see that
+ * function's doc comment for why every `docker compose` invocation in global-setup.ts/
+ * global-teardown.ts passes an explicit process env built from this instead of inheriting
+ * `process.env`.
+ */
+export function composeInterpolationEnv(plan: E2ePlan): Record<string, string> {
+  return {
+    POSTGRES_PASSWORD: plan.postgresPassword,
+    JWT_SECRET: plan.jwtSecret,
+    ANON_KEY: plan.anonKey,
+    SERVICE_ROLE_KEY: plan.serviceRoleKey,
+    DASHBOARD_USERNAME: 'supabase',
+    DASHBOARD_PASSWORD: plan.dashboardPassword,
+    KONG_HTTP_PORT: String(plan.kongPort),
+    POSTGRES_PORT: String(plan.postgresPort),
+    SUPABASE_PUBLIC_URL: plan.supabaseUrl,
+    API_EXTERNAL_URL: `${plan.supabaseUrl}/auth/v1`,
+    // GOTRUE_SITE_URL / GOTRUE_URI_ALLOW_LIST: `requestPasswordReset` (webapp/src/features/auth/
+    // provider.tsx) sends `redirectTo: ${origin}/auth/callback?next=...` - GoTrue rejects any
+    // redirect target outside SITE_URL/this allow list, so both must point at the e2e webapp
+    // origin (with a wildcard covering the `/auth/callback` path) or that call fails for every
+    // email, not just ones that exist.
+    SITE_URL: plan.webUrl,
+    ADDITIONAL_REDIRECT_URLS: `${plan.webUrl}/**`,
+  }
+}
+
+/**
+ * The explicit, closed process env every `docker compose` invocation in global-setup.ts/
+ * global-teardown.ts passes instead of inheriting the caller's `process.env`.
+ *
+ * `docker compose`'s variable interpolation prefers the *shell* environment over `--env-file`
+ * (composeArgs in env.ts always passes `--env-file` pointing at the scratch supabase.env this
+ * plan wrote) - so a `spawnSync(..., { env: process.env })` call would let a leftover or
+ * deliberately poisoned host-shell `POSTGRES_PASSWORD`/`JWT_SECRET`/etc. silently win over this
+ * run's freshly generated ones, defeating the isolation the rest of this file exists to provide.
+ * Building the env from nothing but this plan's own values closes that off entirely: there is
+ * nothing in the process env for the shell to have poisoned in the first place.
+ *
+ * `PATH`/`HOME` are passed through as-is (needed to find the `docker` binary and Docker's own
+ * config/credentials store); `DOCKER_HOST`/`DOCKER_CONTEXT`/`DOCKER_CONFIG` are passed through too
+ * when set, so this still works on setups where the Docker CLI needs them to find the daemon at
+ * all (Colima, OrbStack, a non-default context) - none of those name a compose interpolation
+ * variable, so letting them through cannot reintroduce the leak this function exists to close.
+ */
+export function composeEnv(plan: E2ePlan): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...composeInterpolationEnv(plan) }
+  for (const passthroughVar of ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG']) {
+    const value = process.env[passthroughVar]
+    if (value !== undefined) env[passthroughVar] = value
+  }
+  return env
+}
+
 /** Starts from infra/supabase/.env.example (the same template `generate-secrets.ts` uses) and
  * substitutes this run's generated secrets plus the port/URL overrides that isolate this stack
  * from the dev one. Every other key (SMTP, storage backend, phone auth, ...) keeps its dev-mode
@@ -101,25 +163,12 @@ function buildSupabaseEnvContent(plan: E2ePlan, secrets: E2eSecrets): string {
   const lines = readFileSync(examplePath, 'utf8').split('\n')
 
   const overrides: Record<string, string> = {
-    POSTGRES_PASSWORD: secrets.postgresPassword,
-    JWT_SECRET: secrets.jwtSecret,
-    ANON_KEY: secrets.anonKey,
-    SERVICE_ROLE_KEY: secrets.serviceRoleKey,
-    DASHBOARD_USERNAME: 'supabase',
-    DASHBOARD_PASSWORD: secrets.dashboardPassword,
+    ...composeInterpolationEnv(plan),
+    // Unused by `db`/`auth`/`kong` (the only services e2e starts) but generated for parity, so the
+    // scratch .env stays valid if that ever changes.
     REALTIME_DB_ENC_KEY: secrets.realtimeDbEncKey,
     SECRET_KEY_BASE: secrets.secretKeyBase,
     PG_META_CRYPTO_KEY: secrets.pgMetaCryptoKey,
-    KONG_HTTP_PORT: String(plan.kongPort),
-    POSTGRES_PORT: String(plan.postgresPort),
-    SUPABASE_PUBLIC_URL: plan.supabaseUrl,
-    API_EXTERNAL_URL: `${plan.supabaseUrl}/auth/v1`,
-    // GOTRUE_SITE_URL / GOTRUE_URI_ALLOW_LIST: ForgotPasswordForm's `resetPasswordForEmail` sends
-    // `redirectTo: ${window.location.origin}/reset-password` - GoTrue rejects any redirect target
-    // outside SITE_URL/this allow list, so both must point at the e2e webapp origin or that call
-    // fails for every email, not just ones that exist.
-    SITE_URL: plan.webUrl,
-    ADDITIONAL_REDIRECT_URLS: `${plan.webUrl}/**`,
   }
 
   return lines

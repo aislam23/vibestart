@@ -47,6 +47,21 @@ const resetPasswordRoute = createRoute({
   component: lazyRouteComponent(() => import('./pages'), 'ResetPasswordPage'),
 })
 
+const authCallbackRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/auth/callback',
+  // `error`/`error_description`: GoTrue appends these instead of `code` when the link it
+  // redirected from was already invalid (expired, already used) - see AuthCallbackPage. `next`
+  // is validated against a closed allowlist before use (`safeNextPath`, features/auth), never
+  // trusted as-is.
+  validateSearch: (search: Record<string, unknown>) => ({
+    next: typeof search.next === 'string' ? search.next : undefined,
+    error: typeof search.error === 'string' ? search.error : undefined,
+    error_description: typeof search.error_description === 'string' ? search.error_description : undefined,
+  }),
+  component: lazyRouteComponent(() => import('./pages'), 'AuthCallbackPage'),
+})
+
 const userWorkspaceRoute = createRoute({
   getParentRoute: () => rootRoute,
   id: 'userWorkspace',
@@ -101,6 +116,7 @@ const routeTree = rootRoute.addChildren([
   signupRoute,
   forgotPasswordRoute,
   resetPasswordRoute,
+  authCallbackRoute,
   userWorkspaceRoute.addChildren([
     userHomeRoute,
     userProfileRoute,

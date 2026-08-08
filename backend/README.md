@@ -27,7 +27,7 @@ new models; `profiles` is the one exception, since its id mirrors `auth.users.id
 | Variable | Required | Notes |
 | --- | --- | --- |
 | `DATABASE_URL` | yes | Points at the Supabase Postgres instance, e.g. `postgresql://postgres:PASSWORD@localhost:54322/postgres`. Copy the password from `infra/supabase/.env`. This is the connection the *running app* uses - see "Runtime DB role" below for switching it to a least-privileged role in production. |
-| `MIGRATE_DATABASE_URL` | no | Superuser connection `prisma migrate`/`prisma migrate deploy` use for schema changes. Falls back to `DATABASE_URL` when unset. See "Runtime DB role". |
+| `MIGRATE_DATABASE_URL` | no | Superuser connection `prisma migrate`/`prisma migrate deploy` use for schema changes. Falls back to `DATABASE_URL` when unset. Must connect as `supabase_admin`, not `postgres` - see "Runtime DB role". |
 | `SUPABASE_URL` | yes | Public URL of the Supabase stack (Kong), e.g. `http://localhost:54321`. |
 | `SUPABASE_JWT_SECRET` | yes, ≥32 chars | Shared HS256 secret GoTrue/PostgREST/Realtime/Storage all sign and verify with. Copy `JWT_SECRET` from `infra/supabase/.env`. |
 | `SUPABASE_JWT_ISSUER` | no | The `iss` claim GoTrue stamps on tokens it issues. Defaults to `${SUPABASE_URL}/auth/v1`. In production this must equal GoTrue's *external* auth URL, e.g. `https://supabase.example.com/auth/v1`, not an internal/Docker hostname. |
@@ -170,7 +170,17 @@ Generate `<generated>` yourself (e.g. `openssl rand -base64 32`) and run that st
 as a superuser, against the target database - `bun run secrets:generate` does **not** manage this
 password. Then point `DATABASE_URL` at `backend_runtime` with that password, and set
 `MIGRATE_DATABASE_URL` to the superuser connection so `prisma migrate`/`prisma migrate deploy` keep
-working (see the Env table above). The integration test suite
+working (see the Env table above).
+
+**That superuser connection must be `supabase_admin`, not `postgres`.** In this self-hosted
+Supabase Postgres image, `postgres` is not actually a superuser (only `supabase_admin` has the
+`Superuser` attribute - `\du` shows this directly) and lacks `GRANT OPTION` on the `auth` schema.
+Running the `backend_runtime_role` migration as `postgres` makes its `auth`-schema `GRANT`
+statements silently no-op (a Postgres `WARNING`, not an error - `prisma migrate deploy` still
+reports success), leaving `backend_runtime` unable to read `auth.users` at all despite the
+migration having "succeeded": `postgresql://supabase_admin:${POSTGRES_PASSWORD}@localhost:54322/postgres`
+(same `POSTGRES_PASSWORD` as any other role here - see "Rotating secrets" in
+`infra/supabase/README.md`). The integration test suite
 (`bun run test:backend:integration`) activates and exercises this role automatically against the
 throwaway `db_test` database, so `backend_runtime`'s privileges are covered by CI (see Testing
 below), not just by this migration's SQL.

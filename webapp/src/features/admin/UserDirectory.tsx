@@ -113,13 +113,13 @@ export function UserDirectory({ currentUser }: { currentUser: UserDto }) {
             <AlertTitle>Role changed</AlertTitle>
             <AlertDescription>
               {roleMutation.data.user.email} is now {roleMutation.data.user.role}.
-              Their previous sessions have been revoked.
+              The new role applies on their next request.
             </AlertDescription>
           </Alert>
         )}
 
         <DataTableFrame
-          description="Role changes revoke the affected user’s active sessions."
+          description="Role changes apply on the affected user’s next request - no sign-out required."
           nextDisabled={!pagination?.canGoNext}
           onNext={() => setPage((current) => current + 1)}
           onPrevious={() => setPage((current) => Math.max(1, current - 1))}

@@ -13,7 +13,7 @@ export function useUpdateProfileMutation() {
       updateProfile(auth.transport, { displayName }),
     onSuccess: (response) => {
       queryClient.setQueryData(
-        authQueryKeys.me(),
+        authQueryKeys.me(auth.user?.id ?? null),
         { user: response.user } satisfies MeResponse,
       )
     },

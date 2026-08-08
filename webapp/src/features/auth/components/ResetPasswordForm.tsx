@@ -20,7 +20,12 @@ const invalidLinkMessage = 'This password reset link is invalid or has expired. 
  * Consumes the recovery session Supabase establishes by parsing the reset-link URL on load
  * (`detectSessionInUrl`, on by default) - there is no token to thread through props here, only
  * `auth.isPasswordRecovery`, which the provider sets once it observes the `PASSWORD_RECOVERY`
- * auth event.
+ * auth event. Link validity is read from `auth.isPasswordRecovery` directly on every render
+ * (`linkIsValid` below), never snapshotted into local state - the event can still be in flight
+ * when this form first mounts (the callback route's own bootstrap wait covers the common case, but
+ * `AuthProvider`'s auth-bridge buffering means it is never actually missed - see auth-bridge.ts),
+ * so a link that renders as invalid on the very first paint must still flip to valid the instant
+ * the event lands, with no interaction required to pick that up.
  */
 export function ResetPasswordForm() {
   const auth = useAuth()
@@ -31,13 +36,17 @@ export function ResetPasswordForm() {
   const confirmPasswordId = useId()
   const confirmPasswordErrorId = useId()
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
-  const [formError, setFormError] = useState<string | null>(linkIsValid ? null : invalidLinkMessage)
+  // Only ever holds a submission-time message (validation/API failure); the invalid-link message
+  // is derived below (`displayedFormError`) so it always reflects the current `linkIsValid`,
+  // including a link that starts invalid and turns valid once the recovery event lands.
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [completed, setCompleted] = useState(false)
+  const displayedFormError = submitError ?? (linkIsValid ? null : invalidLinkMessage)
   const form = useForm({
     defaultValues: { password: '', confirmPassword: '' },
     onSubmit: async ({ value }) => {
       if (!linkIsValid) return
-      setFormError(null)
+      setSubmitError(null)
       const result = passwordSchema.safeParse(value.password)
       const nextErrors: FieldErrors = result.success
         ? {}
@@ -55,7 +64,7 @@ export function ResetPasswordForm() {
         await auth.updatePassword(result.data)
         setCompleted(true)
       } catch (caughtError) {
-        setFormError(
+        setSubmitError(
           caughtError instanceof ApiRequestError
             ? caughtError.message
             : 'Unable to reset your password',
@@ -108,7 +117,7 @@ export function ResetPasswordForm() {
                     field.handleChange(event.target.value)
                     clearFieldError('password', setFieldErrors)
                     clearFieldError('confirmPassword', setFieldErrors)
-                    setFormError(linkIsValid ? null : invalidLinkMessage)
+                    setSubmitError(null)
                   }}
                   value={field.state.value}
                   visibilityLabel="replacement password"
@@ -135,7 +144,7 @@ export function ResetPasswordForm() {
                   onChange={(event) => {
                     field.handleChange(event.target.value)
                     clearFieldError('confirmPassword', setFieldErrors)
-                    setFormError(linkIsValid ? null : invalidLinkMessage)
+                    setSubmitError(null)
                   }}
                   value={field.state.value}
                   visibilityLabel="password confirmation"
@@ -144,7 +153,7 @@ export function ResetPasswordForm() {
               </Field>
             )} />
 
-            <FormAlert message={formError} title="Password reset failed" />
+            <FormAlert message={displayedFormError} title="Password reset failed" />
 
             <Field>
               <form.Subscribe selector={(state) => state.isSubmitting} children={(isSubmitting) => (

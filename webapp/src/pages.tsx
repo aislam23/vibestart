@@ -3,6 +3,7 @@ import type { UserDto, UserRole } from '@vibestart/contracts'
 import { useEffect, useRef, type ReactNode } from 'react'
 
 import {
+  AuthCallbackErrorSection,
   NotFoundSection,
   SessionErrorSection,
   SessionLoadingSection,
@@ -15,6 +16,7 @@ import {
   LoginForm,
   RegisterForm,
   ResetPasswordForm,
+  safeNextPath,
   useAuth,
 } from '@/features/auth'
 import { homePathForRole, safeReturnPath } from '@/features/navigation'
@@ -82,6 +84,37 @@ export function ResetPasswordPage() {
       <ResetPasswordForm />
     </AuthPageShell>
   )
+}
+
+/**
+ * Lands here from a Supabase email link (password recovery today; any future confirmation/invite
+ * link would too) once PKCE's `redirectTo` brings the browser back. supabase-js's
+ * `detectSessionInUrl` (on by default, see platform/supabase/client.ts) exchanges a `?code=` in
+ * the URL for a session automatically - this page only has to wait for that to reach `AuthProvider`
+ * (the spinner) and then continue to `next`, or show the failure state GoTrue itself signals via
+ * `?error=`/`?error_description=` when the link was already invalid (expired, already used) and
+ * never got as far as issuing a code.
+ */
+export function AuthCallbackPage() {
+  const auth = useAuth()
+  const { error, error_description: errorDescription, next } = useSearch({ from: '/auth/callback' })
+
+  if (error) {
+    return (
+      <AuthCallbackErrorSection
+        description={errorDescription || 'This sign-in link is invalid or has expired. Request a new one.'}
+      />
+    )
+  }
+
+  if (auth.isBootstrapping) return <SessionLoadingSection />
+
+  const destination = auth.isPasswordRecovery
+    ? safeNextPath(next)
+    : auth.user
+      ? homePathForRole(auth.user.role)
+      : '/login'
+  return <HrefRedirect href={destination} />
 }
 
 export function UserHomePage() {

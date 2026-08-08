@@ -40,7 +40,7 @@ export function RoleChangeDialog({
           <AlertDialogTitle>Change user role?</AlertDialogTitle>
           <AlertDialogDescription>
             {pendingChange
-              ? `${pendingChange.user.email} will become ${pendingChange.role}. Their active sessions will be revoked.`
+              ? `${pendingChange.user.email} will become ${pendingChange.role}. This applies to their next request - no need to sign them out.`
               : ''}
           </AlertDialogDescription>
         </AlertDialogHeader>
